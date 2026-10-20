@@ -101,8 +101,7 @@ class RiskAuditorAgent:
             "sl_pct": sl_pct_move * 100.0,
             "dist_pct": dist_pct * 100.0
         }
-
-    def broadcast_signal(self, plan: Dict[str, Any]):
+def broadcast_signal(self, plan: Dict[str, Any]):
         if not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             return
 
@@ -111,10 +110,17 @@ class RiskAuditorAgent:
         icon = "🟢" if d == "LONG" else "🔴"
         now_str = datetime.datetime.now(VN_TZ).strftime("%H:%M:%S")
 
+        # Lấy nhãn chế độ quét và kịch bản thiết lập từ Scout
+        engine_mode = plan.get("engine_mode", "ALPHA")
+        mode_tag = "🌊 [SÓNG ĐỒNG PHA BETA]" if engine_mode == "BETA_TREND" else "⚡ [SÓNG NỔ ĐỘC LẬP ALPHA]"
+        setup_desc = plan.get("signal_desc", "Theo dõi tín hiệu kỹ thuật")
+
         msg = (
             f"🛡️ <b>[TÍN HIỆU COPILOT V2] ({now_str})</b>\n"
+            f"<b>{mode_tag}</b>\n"
             f"✅ <b>KÈO ĐẠT CHUẨN AN TOÀN! ({icon} {d})</b>\n"
             f"• <b>Mã:</b> {sym}\n"
+            f"• <b>Thiết lập:</b> {setup_desc}\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"• <b>Lệnh:</b> LIMIT <code>{plan['entry']:.5f}</code> (Cách TT <b>{plan['dist_pct']:.2f}%</b>)\n"
             f"• <b>Stop Loss:</b> <code>{plan['stop_loss']:.5f}</code> (Đệm <b>{plan['sl_pct']:.2f}%</b>)\n"
