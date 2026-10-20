@@ -4,7 +4,8 @@ import logging
 import asyncio
 import time
 import requests
-from config import TELEGRAM_BOT_TOKEN, ENABLE_TELEGRAM
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ENABLE_TELEGRAM, VN_TZ
+import datetime
 from data.mexc_client import MexcPublicClient
 from data.universe import UniverseManager
 from agent_strategist import StrategistAgent
@@ -17,10 +18,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("MultiAgentEngineV2")
 
 # =========================================================================
-# ASYNC HTTP HEALTH CHECK SERVER (DÀNH RIÊNG CHO RENDER WEB SERVICE MIỄN PHÍ)
+# ASYNC HTTP HEALTH CHECK SERVER CHO RENDER
 # =========================================================================
 async def handle_http_request(reader, writer):
-    """Phản hồi HTTP 200 OK cho Render Health Check mà không cần thư viện ngoài"""
     try:
         await reader.read(512)
         response = (
@@ -58,6 +58,27 @@ risk_ctrl = RiskControllerAgent()
 scout = ScoutAgent(client)
 auditor = RiskAuditorAgent()
 monitor = PositionMonitorAgent(client)
+
+def send_startup_alert():
+    """Gửi thông báo ngay khi hệ thống online để xác nhận kết nối Telegram"""
+    if not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    now_str = datetime.datetime.now(VN_TZ).strftime("%H:%M:%S - %d/%m/%Y")
+    msg = (
+        f"🚀 <b>[QUANT COPILOT V2 ĐÃ ONLINE]</b>\n"
+        f"• <b>Thời gian:</b> {now_str}\n"
+        f"• <b>Trạng thái:</b> Sẵn sàng quét thị trường & giám sát lệnh.\n"
+        f"• <b>Chu kỳ quét:</b> 180s/lần | <b>Độ sâu:</b> 100 nến 15M/1H."
+    )
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        res = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=8)
+        if res.status_code == 200:
+            logger.info("✅ Đã gửi thông báo khởi động lên Telegram thành công!")
+        else:
+            logger.error(f"Lỗi gửi Telegram: {res.text}")
+    except Exception as e:
+        logger.error(f"Ngoại lệ gửi tin nhắn Telegram: {e}")
 
 async def telegram_button_listener():
     """Lắng nghe nút bấm [ ✅ ĐÃ VÀO LỆNH ] trên Telegram"""
@@ -111,18 +132,22 @@ async def pipeline_scan_loop():
     """Chu kỳ quét thị trường 180 giây"""
     while True:
         try:
+            logger.info("🔍 [SCAN LOOP] Bắt đầu chu kỳ quét thị trường...")
             # 1. THE STRATEGIST: Cập nhật vĩ mô & tin tức
             macro = await asyncio.to_thread(strategist.update_btc_macro)
             if not macro.get("allow_trade", True):
-                logger.warning(f"⏸️ [TẠM DỪNG QUÉT]: {macro.get('news_reason') or 'BTC biến động sốc'}")
+                reason = macro.get("news_reason") or "BTC giật sốc"
+                logger.warning(f"⏸️ [TẠM DỪNG QUÉT]: {reason}")
                 await asyncio.sleep(180)
                 continue
 
             btc_bias = macro.get("bias", "NEUTRAL")
+            logger.info(f"📊 [BTC MACRO] Xu hướng BTC: {btc_bias} | Biến động 15M: {macro.get('btc_change_15m_pct')}%")
 
             # 2. Lọc danh sách coin đủ thanh khoản >= 1.5M USDT
             eligible, _ = await asyncio.to_thread(universe.get_eligible_symbols, 1500000.0)
             target_symbols = [x["symbol"] for x in eligible[:120]]
+            logger.info(f"📋 Lọc được {len(target_symbols)} cặp coin đạt điều kiện thanh khoản.")
 
             # 3. THE SCOUT: Quét ứng viên
             candidates = []
@@ -132,20 +157,23 @@ async def pipeline_scan_loop():
                     candidates.append(c)
                 await asyncio.sleep(0.02)
 
+            logger.info(f"🎯 Scout tìm ra {len(candidates)} ứng viên tiềm năng.")
+
             # 4. THE AUDITOR & RISK CONTROLLER: Thẩm định và phát tín hiệu
             for item in candidates[:3]:
                 funding = await asyncio.to_thread(client.get_funding_rate, item["symbol"])
                 can_open, risk_reason = risk_ctrl.can_open_position(item["bias"], funding)
                 if not can_open:
-                    logger.info(f"Từ chối {item['symbol']} do Risk Controller: {risk_reason}")
+                    logger.info(f"🛡️ [RISK VETO] {item['symbol']}: {risk_reason}")
                     continue
 
                 is_valid, audit_reason, plan = await asyncio.to_thread(auditor.audit_trade, item)
                 if is_valid:
+                    logger.info(f"🚀 [DUYỆT LỆNH] Phát tín hiệu {plan['symbol']} ({plan['direction']}) lên Telegram!")
                     await asyncio.to_thread(auditor.broadcast_signal_with_button, plan)
                     await asyncio.sleep(1.0)
                 else:
-                    logger.info(f"Từ chối {item['symbol']} do Auditor: {audit_reason}")
+                    logger.info(f"🛡️ [AUDITOR VETO] {item['symbol']}: {audit_reason}")
 
         except Exception as e:
             logger.error(f"Lỗi pipeline: {e}")
@@ -154,6 +182,10 @@ async def pipeline_scan_loop():
 
 async def main():
     logger.info("🚀 KHỞI ĐỘNG HỆ THỐNG QUANT MULTI-AGENT COPILOT V2")
+    
+    # Gửi tin nhắn test lên Telegram xác nhận kết nối
+    send_startup_alert()
+
     # Khởi chạy đồng thời: Cổng HTTP cho Render + Vòng quét thị trường + Giám sát lệnh + Lắng nghe Telegram
     await asyncio.gather(
         start_health_server(),
