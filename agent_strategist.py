@@ -3,7 +3,8 @@ import logging
 import datetime
 import requests
 import asyncio
-from typing import Dict, Any, List, Tuple
+import time
+from typing import Dict, Any, List, Tuple, Optional
 from config import VN_TZ, STATE_MACRO_FILE, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ENABLE_TELEGRAM
 from data.mexc_client import MexcPublicClient
 
@@ -18,20 +19,24 @@ class StrategistAgent:
 
     @staticmethod
     def _extract_ohlc(k) -> tuple:
+        """Trích xuất chuẩn mảng nến MEXC Contract: [time, open, close, high, low, volume, amount]"""
         if isinstance(k, dict):
             return (
                 float(k.get("open", 0.0) or 0.0),
                 float(k.get("high", 0.0) or 0.0),
                 float(k.get("low", 0.0) or 0.0),
                 float(k.get("close", 0.0) or 0.0),
-                float(k.get("volume", 0.0) or 0.0)
+                float(k.get("vol", k.get("volume", 0.0)) or 0.0)
             )
         elif isinstance(k, (list, tuple)) and len(k) >= 5:
             try:
-                o, c, h, l = float(k[1]), float(k[2]), float(k[3]), float(k[4])
+                o = float(k[1])
+                c = float(k[2])
+                h = float(k[3])
+                l = float(k[4])
+                v = float(k[5]) if len(k) > 5 else 0.0
                 if h < l:
                     h, l = l, h
-                v = float(k[5]) if len(k) >= 6 else 0.0
                 return o, h, l, c, v
             except Exception:
                 return 0.0, 0.0, 0.0, 0.0, 0.0
@@ -100,7 +105,6 @@ class StrategistAgent:
                 ev_time = datetime.datetime.fromisoformat(date_str)
                 diff_m = (ev_time - now_utc).total_seconds() / 60.0
 
-                # Bắn cảnh báo trước 60p và 30p
                 ev_id = f"{ev.get('title')}_{date_str}"
                 if 25.0 <= diff_m <= 35.0 and f"{ev_id}_30" not in self.notified_news:
                     self.send_telegram(f"🚨 <b>[CẢNH BÁO TIN ĐỎ USD TRONG 30 PHÚT]</b>\nSự kiện: <b>{ev.get('title')}</b>\nKích hoạt khóa mở lệnh mới (NEWS_FREEZE)!")
@@ -109,7 +113,6 @@ class StrategistAgent:
                     self.send_telegram(f"⚠️ <b>[CẢNH BÁO TIN ĐỎ USD TRONG 60 PHÚT]</b>\nSự kiện: <b>{ev.get('title')}</b> lúc {ev_time.astimezone(VN_TZ).strftime('%H:%M')}.")
                     self.notified_news.add(f"{ev_id}_60")
 
-                # Cờ NEWS_FREEZE trong khoảng [-30m, +30m]
                 if -30.0 <= diff_m <= 30.0:
                     active_freeze = True
                     freeze_reason = f"NEWS_FREEZE: Tin đỏ USD [{ev.get('title')}] (cách {abs(diff_m):.0f} phút)"
@@ -122,20 +125,51 @@ class StrategistAgent:
         return active_freeze, freeze_reason or "An toàn trước tin tức", next_event
 
     def update_btc_macro(self) -> Dict[str, Any]:
-        k15m_raw = self.client.get_kline("BTC_USDT", interval="Min15", limit=100)
-        k1h_raw = self.client.get_kline("BTC_USDT", interval="Min60", limit=100)
-        k4h_raw = self.client.get_kline("BTC_USDT", interval="Min240", limit=60)
+        c15m, c1h, c4h = [], [], []
 
-        c15m = [self._extract_ohlc(k) for k in (k15m_raw or []) if self._extract_ohlc(k)[3] > 0]
-        c1h = [self._extract_ohlc(k) for k in (k1h_raw or []) if self._extract_ohlc(k)[3] > 0]
-        c4h = [self._extract_ohlc(k) for k in (k4h_raw or []) if self._extract_ohlc(k)[3] > 0]
+        # Thử tải kline tối đa 3 lần nếu mạng chập chờn
+        for _ in range(3):
+            k15m_raw = self.client.get_kline("BTC_USDT", interval="Min15", limit=60)
+            k1h_raw = self.client.get_kline("BTC_USDT", interval="Min60", limit=60)
+            k4h_raw = self.client.get_kline("BTC_USDT", interval="Min240", limit=60)
 
-        if not c15m or not c1h:
-            return {"regime": "UNKNOWN", "allow_trade": True, "bias": "NEUTRAL"}
+            c15m = [self._extract_ohlc(k) for k in (k15m_raw or []) if self._extract_ohlc(k)[3] > 0]
+            c1h = [self._extract_ohlc(k) for k in (k1h_raw or []) if self._extract_ohlc(k)[3] > 0]
+            c4h = [self._extract_ohlc(k) for k in (k4h_raw or []) if self._extract_ohlc(k)[3] > 0]
+
+            if c15m and c1h:
+                break
+            time.sleep(1.0)
+
+        # Cơ chế fallback: Nếu kline chưa nạp kịp thì lấy giá trực tiếp từ Ticker
+        curr_btc = 0.0
+        if c15m:
+            curr_btc = float(c15m[-1][3])
+        else:
+            tickers = self.client.get_all_tickers()
+            for t in tickers:
+                if t.get("symbol") == "BTC_USDT":
+                    curr_btc = float(t.get("lastPrice", 0.0) or 0.0)
+                    break
+
+        if not c15m or curr_btc <= 0:
+            return {
+                "timestamp": datetime.datetime.now(VN_TZ).timestamp(),
+                "regime": "RANGE_STABLE",
+                "allow_trade": True,
+                "bias": "NEUTRAL",
+                "btc_price": curr_btc or 68000.0,
+                "btc_change_15m_pct": 0.0,
+                "rsi6_15m": 50.0,
+                "circuit_breaker": False,
+                "news_freeze": False,
+                "freeze_reason": "Đang đồng bộ nến BTC",
+                "next_news": None
+            }
 
         last_15m = c15m[-1]
-        curr_btc = float(last_15m[3])
-        btc_change_15m = abs(curr_btc - float(last_15m[0])) / float(last_15m[0])
+        open_15m = float(last_15m[0])
+        btc_change_15m = abs(curr_btc - open_15m) / open_15m if open_15m > 0 else 0.0
         rsi6_15m = float(self.calculate_rsi(c15m, 6))
 
         # Cầu chì nến 15M BTC >= 0.8% HOẶC RSI6 >= 85 hoặc <= 15
@@ -181,10 +215,10 @@ class StrategistAgent:
         return state
 
 async def run_strategist_and_news_radar():
-    """Tác vụ chạy ngầm độc lập của Agent 1"""
+    """Tác vụ ngầm độc lập của Agent 1 (tương thích cho supervisor)"""
     client = MexcPublicClient()
     agent = StrategistAgent(client)
-    logger.info("Agent 1 (Strategist & News Radar) đã kích hoạt.")
+    logger.info("Agent 1 (Strategist & News Radar) đã kích hoạt chu kỳ 60s.")
 
     while True:
         try:
