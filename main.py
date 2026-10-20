@@ -1,9 +1,9 @@
-import asyncio
-import logging
 import os
+import sys
+import logging
+import asyncio
+import time
 import requests
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from config import TELEGRAM_BOT_TOKEN, ENABLE_TELEGRAM
 from data.mexc_client import MexcPublicClient
 from data.universe import UniverseManager
@@ -17,24 +17,36 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("MultiAgentEngineV2")
 
 # =========================================================================
-# DUMMY HTTP SERVER ĐỂ RENDER NHẬN DIỆN PORT VÀ BÁO "LIVE" (WEB SERVICE MIỄN PHÍ)
+# ASYNC HTTP HEALTH CHECK SERVER (DÀNH RIÊNG CHO RENDER WEB SERVICE MIỄN PHÍ)
 # =========================================================================
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"Quant Copilot V2 Engine is Running Healthy!")
+async def handle_http_request(reader, writer):
+    """Phản hồi HTTP 200 OK cho Render Health Check mà không cần thư viện ngoài"""
+    try:
+        await reader.read(512)
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            "Content-Length: 43\r\n"
+            "Connection: close\r\n\r\n"
+            "Quant Copilot V2 Engine is Live and Healthy!"
+        )
+        writer.write(response.encode("utf-8"))
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
 
-    def log_message(self, format, *args):
-        # Tắt log HTTP rác để console chỉ hiện log bot
-        return
-
-def run_health_server():
-    port = int(os.getenv("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    logger.info(f"🌐 [PORT BINDING] Đã mở cổng HTTP Health Check trên port {port} cho Render.")
-    server.serve_forever()
+async def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = await asyncio.start_server(handle_http_request, "0.0.0.0", port)
+    logger.info(f"🌐 [PORT BINDING] Server HTTP Health Check đã mở ngay cổng {port} cho Render!")
+    async with server:
+        await server.serve_forever()
 
 # =========================================================================
 # KHỞI TẠO CÁC AGENT
@@ -48,7 +60,7 @@ auditor = RiskAuditorAgent()
 monitor = PositionMonitorAgent(client)
 
 async def telegram_button_listener():
-    """Lắng nghe sự kiện người dùng bấm nút [ ✅ ĐÃ VÀO LỆNH ] trên Telegram"""
+    """Lắng nghe nút bấm [ ✅ ĐÃ VÀO LỆNH ] trên Telegram"""
     if not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN:
         return
 
@@ -66,7 +78,6 @@ async def telegram_button_listener():
                     if callback:
                         cb_data = callback.get("data", "")
                         if cb_data.startswith("ENTER_"):
-                            # Format: ENTER_{sym}_{direction}_{entry}_{sl}_{tp1}_{tp2}
                             parts = cb_data.split("_")
                             sym = parts[1]
                             direction = parts[2]
@@ -97,10 +108,10 @@ async def position_monitor_loop():
         await asyncio.sleep(60)
 
 async def pipeline_scan_loop():
-    """Chu kỳ quét thị trường 180 giây của Strategist, Scout và Auditor"""
+    """Chu kỳ quét thị trường 180 giây"""
     while True:
         try:
-            # 1. THE STRATEGIST: Cập nhật vĩ mô & lịch tin tức
+            # 1. THE STRATEGIST: Cập nhật vĩ mô & tin tức
             macro = await asyncio.to_thread(strategist.update_btc_macro)
             if not macro.get("allow_trade", True):
                 logger.warning(f"⏸️ [TẠM DỪNG QUÉT]: {macro.get('news_reason') or 'BTC biến động sốc'}")
@@ -109,7 +120,7 @@ async def pipeline_scan_loop():
 
             btc_bias = macro.get("bias", "NEUTRAL")
 
-            # 2. Lọc danh sách ứng viên đạt chuẩn thanh khoản >= 1.5M USDT
+            # 2. Lọc danh sách coin đủ thanh khoản >= 1.5M USDT
             eligible, _ = await asyncio.to_thread(universe.get_eligible_symbols, 1500000.0)
             target_symbols = [x["symbol"] for x in eligible[:120]]
 
@@ -143,13 +154,9 @@ async def pipeline_scan_loop():
 
 async def main():
     logger.info("🚀 KHỞI ĐỘNG HỆ THỐNG QUANT MULTI-AGENT COPILOT V2")
-    
-    # Chạy HTTP Server ngầm trong thread riêng để phục vụ Render Health Check
-    t = threading.Thread(target=run_health_server, daemon=True)
-    t.start()
-
-    # Chạy song song các tiến trình chính của bot
+    # Khởi chạy đồng thời: Cổng HTTP cho Render + Vòng quét thị trường + Giám sát lệnh + Lắng nghe Telegram
     await asyncio.gather(
+        start_health_server(),
         pipeline_scan_loop(),
         position_monitor_loop(),
         telegram_button_listener()
