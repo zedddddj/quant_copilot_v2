@@ -9,16 +9,12 @@ logger = logging.getLogger("TheRiskController")
 
 class RiskControllerAgent:
     def __init__(self):
-        self._ensure_state_files()
+        self._ensure_file()
 
-    def _ensure_state_files(self):
+    def _ensure_file(self):
         if not os.path.exists(STATE_RISK_FILE):
-            initial_state = {
-                "recent_stop_losses": [],
-                "circuit_breaker_lock_until": 0
-            }
             with open(STATE_RISK_FILE, "w", encoding="utf-8") as f:
-                json.dump(initial_state, f, indent=2)
+                json.dump({"recent_stop_losses": [], "circuit_breaker_lock_until": 0}, f, indent=2)
 
     def load_risk_state(self) -> Dict[str, Any]:
         try:
@@ -34,9 +30,10 @@ class RiskControllerAgent:
         recent_sl.append({"symbol": symbol, "time": now})
         state["recent_stop_losses"] = recent_sl
 
+        # Cầu chì tài khoản: Dính 2 SL trong 12 tiếng -> Khóa 12 tiếng
         if len(recent_sl) >= 2:
             state["circuit_breaker_lock_until"] = now + 43200
-            logger.critical("🚨 CẦU CHÌ TÀI KHOẢN KÍCH HOẠT: Dính 2 SL liên tiếp! Khóa mở lệnh 12 tiếng.")
+            logger.critical("🚨 CẦU CHÌ TÀI KHOẢN KÍCH HOẠT: Dính 2 SL liên tiếp! Tự động khóa mở lệnh 12 tiếng.")
 
         with open(STATE_RISK_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
@@ -45,17 +42,20 @@ class RiskControllerAgent:
         state = self.load_risk_state()
         now = time.time()
 
+        # 1. Kiểm tra Cầu chì tài khoản
         lock_until = state.get("circuit_breaker_lock_until", 0)
         if now < lock_until:
             rem_h = (lock_until - now) / 3600.0
-            return False, f"Cầu chì tài khoản đang kích hoạt: Khóa mở lệnh còn {rem_h:.1f}h do dính 2 SL liên tiếp"
+            return False, f"Cầu chì tài khoản đang kích hoạt: Khóa mở lệnh còn {rem_h:.1f}h do 2 SL liên tiếp"
 
+        # 2. Bẫy Funding Rate (>= +0.1% cấm Long, <= -0.1% cấm Short)
         fr_pct = funding_rate * 100.0
         if direction == "LONG" and fr_pct >= 0.10:
-            return False, f"Funding Rate quá cao ({fr_pct:.3f}% >= +0.10%), rủi ro Long bị đè phí"
+            return False, f"Funding Rate quá cao ({fr_pct:.3f}% >= +0.10%), cấm Long tránh bẫy đè phí"
         if direction == "SHORT" and fr_pct <= -0.10:
-            return False, f"Funding Rate quá âm ({fr_pct:.3f}% <= -0.10%), rủi ro Short bị đè phí"
+            return False, f"Funding Rate quá âm ({fr_pct:.3f}% <= -0.10%), cấm Short tránh bẫy đè phí"
 
+        # 3. Khống chế tối đa 2 vị thế cùng chiều
         try:
             if os.path.exists(STATE_TRADES_FILE):
                 with open(STATE_TRADES_FILE, "r", encoding="utf-8") as f:
