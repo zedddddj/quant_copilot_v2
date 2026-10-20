@@ -1,7 +1,7 @@
 import requests
 import logging
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 logger = logging.getLogger("MEXC_Client")
 
