@@ -1,6 +1,9 @@
 import asyncio
 import logging
+import os
 import requests
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from config import TELEGRAM_BOT_TOKEN, ENABLE_TELEGRAM
 from data.mexc_client import MexcPublicClient
 from data.universe import UniverseManager
@@ -13,6 +16,29 @@ from agent_monitor import PositionMonitorAgent
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("MultiAgentEngineV2")
 
+# =========================================================================
+# DUMMY HTTP SERVER ĐỂ RENDER NHẬN DIỆN PORT VÀ BÁO "LIVE" (WEB SERVICE MIỄN PHÍ)
+# =========================================================================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Quant Copilot V2 Engine is Running Healthy!")
+
+    def log_message(self, format, *args):
+        # Tắt log HTTP rác để console chỉ hiện log bot
+        return
+
+def run_health_server():
+    port = int(os.getenv("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logger.info(f"🌐 [PORT BINDING] Đã mở cổng HTTP Health Check trên port {port} cho Render.")
+    server.serve_forever()
+
+# =========================================================================
+# KHỞI TẠO CÁC AGENT
+# =========================================================================
 client = MexcPublicClient()
 universe = UniverseManager(client)
 strategist = StrategistAgent(client)
@@ -22,6 +48,7 @@ auditor = RiskAuditorAgent()
 monitor = PositionMonitorAgent(client)
 
 async def telegram_button_listener():
+    """Lắng nghe sự kiện người dùng bấm nút [ ✅ ĐÃ VÀO LỆNH ] trên Telegram"""
     if not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN:
         return
 
@@ -39,6 +66,7 @@ async def telegram_button_listener():
                     if callback:
                         cb_data = callback.get("data", "")
                         if cb_data.startswith("ENTER_"):
+                            # Format: ENTER_{sym}_{direction}_{entry}_{sl}_{tp1}_{tp2}
                             parts = cb_data.split("_")
                             sym = parts[1]
                             direction = parts[2]
@@ -60,6 +88,7 @@ async def telegram_button_listener():
         await asyncio.sleep(2)
 
 async def position_monitor_loop():
+    """Vòng lặp giám sát vị thế nền mỗi 60 giây"""
     while True:
         try:
             await asyncio.to_thread(monitor.check_active_positions)
@@ -68,8 +97,10 @@ async def position_monitor_loop():
         await asyncio.sleep(60)
 
 async def pipeline_scan_loop():
+    """Chu kỳ quét thị trường 180 giây của Strategist, Scout và Auditor"""
     while True:
         try:
+            # 1. THE STRATEGIST: Cập nhật vĩ mô & lịch tin tức
             macro = await asyncio.to_thread(strategist.update_btc_macro)
             if not macro.get("allow_trade", True):
                 logger.warning(f"⏸️ [TẠM DỪNG QUÉT]: {macro.get('news_reason') or 'BTC biến động sốc'}")
@@ -78,9 +109,11 @@ async def pipeline_scan_loop():
 
             btc_bias = macro.get("bias", "NEUTRAL")
 
+            # 2. Lọc danh sách ứng viên đạt chuẩn thanh khoản >= 1.5M USDT
             eligible, _ = await asyncio.to_thread(universe.get_eligible_symbols, 1500000.0)
             target_symbols = [x["symbol"] for x in eligible[:120]]
 
+            # 3. THE SCOUT: Quét ứng viên
             candidates = []
             for sym in target_symbols:
                 c = await asyncio.to_thread(scout.scan_candidate, sym, btc_bias)
@@ -88,6 +121,7 @@ async def pipeline_scan_loop():
                     candidates.append(c)
                 await asyncio.sleep(0.02)
 
+            # 4. THE AUDITOR & RISK CONTROLLER: Thẩm định và phát tín hiệu
             for item in candidates[:3]:
                 funding = await asyncio.to_thread(client.get_funding_rate, item["symbol"])
                 can_open, risk_reason = risk_ctrl.can_open_position(item["bias"], funding)
@@ -109,6 +143,12 @@ async def pipeline_scan_loop():
 
 async def main():
     logger.info("🚀 KHỞI ĐỘNG HỆ THỐNG QUANT MULTI-AGENT COPILOT V2")
+    
+    # Chạy HTTP Server ngầm trong thread riêng để phục vụ Render Health Check
+    t = threading.Thread(target=run_health_server, daemon=True)
+    t.start()
+
+    # Chạy song song các tiến trình chính của bot
     await asyncio.gather(
         pipeline_scan_loop(),
         position_monitor_loop(),
