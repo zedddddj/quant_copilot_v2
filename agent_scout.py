@@ -1,5 +1,6 @@
 import logging
 import math
+import asyncio
 from typing import List, Dict, Any, Optional
 from data.mexc_client import MexcPublicClient
 
@@ -17,28 +18,18 @@ class ScoutAgent:
                 float(k.get("high", 0.0) or 0.0),
                 float(k.get("low", 0.0) or 0.0),
                 float(k.get("close", 0.0) or 0.0),
-                float(k.get("volume", 0.0) or 0.0)
+                float(k.get("vol", k.get("volume", 0.0)) or 0.0)
             )
         elif isinstance(k, (list, tuple)) and len(k) >= 5:
             try:
                 o, c, h, l = float(k[1]), float(k[2]), float(k[3]), float(k[4])
                 if h < l:
                     h, l = l, h
-                v = float(k[5]) if len(k) >= 6 else 0.0
+                v = float(k[5]) if len(k) > 5 else 0.0
                 return o, h, l, c, v
             except Exception:
                 return 0.0, 0.0, 0.0, 0.0, 0.0
         return 0.0, 0.0, 0.0, 0.0, 0.0
-
-    @staticmethod
-    def calculate_ema(closes: List[float], period: int) -> float:
-        if len(closes) < period:
-            return closes[-1] if closes else 0.0
-        multiplier = 2.0 / (period + 1.0)
-        ema = sum(closes[:period]) / period
-        for price in closes[period:]:
-            ema = (price - ema) * multiplier + ema
-        return ema
 
     @staticmethod
     def calculate_bollinger_bands(candles: list, period: int = 20) -> tuple:
@@ -54,218 +45,173 @@ class ScoutAgent:
         return upper, sma, lower, bandwidth
 
     @staticmethod
-    def calculate_correlation_and_beta(alt_closes: List[float], btc_closes: List[float]) -> tuple:
-        """Tính hệ số tương quan Pearson và Beta giữa Altcoin và BTC trên 30 nến 15M gần nhất"""
-        n = min(len(alt_closes), len(btc_closes), 30)
-        if n < 15:
-            return 0.0, 1.0
+    def calculate_rsi(candles: list, period: int = 6) -> float:
+        if len(candles) < period + 1:
+            return 50.0
+        gains, losses = [], []
+        for i in range(-period, 0):
+            diff = float(candles[i][3]) - float(candles[i - 1][3])
+            if diff >= 0:
+                gains.append(diff)
+                losses.append(0.0)
+            else:
+                gains.append(0.0)
+                losses.append(abs(diff))
+        avg_gain = sum(gains) / period
+        avg_loss = sum(losses) / period
+        if avg_loss == 0:
+            return 100.0
+        return 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
 
-        alt_ret = [(alt_closes[i] - alt_closes[i - 1]) / alt_closes[i - 1] for i in range(-n + 1, 0)]
-        btc_ret = [(btc_closes[i] - btc_closes[i - 1]) / btc_closes[i - 1] for i in range(-n + 1, 0)]
+    @staticmethod
+    def calculate_adx(candles: list, period: int = 14) -> float:
+        if len(candles) < period * 2:
+            return 20.0
+        tr_list, dm_pos, dm_neg = [], [], []
+        for i in range(1, len(candles)):
+            h, l = float(candles[i][1]), float(candles[i][2])
+            prev_h, prev_l, prev_c = float(candles[i-1][1]), float(candles[i-1][2]), float(candles[i-1][3])
+            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+            up_move = h - prev_h
+            down_move = prev_l - l
+            tr_list.append(tr)
+            dm_pos.append(up_move if up_move > down_move and up_move > 0 else 0.0)
+            dm_neg.append(down_move if down_move > up_move and down_move > 0 else 0.0)
 
-        mean_alt = sum(alt_ret) / len(alt_ret)
-        mean_btc = sum(btc_ret) / len(btc_ret)
+        if len(tr_list) < period:
+            return 20.0
 
-        cov = sum((a - mean_alt) * (b - mean_btc) for a, b in zip(alt_ret, btc_ret))
-        var_alt = sum((a - mean_alt) ** 2 for a in alt_ret)
-        var_btc = sum((b - mean_btc) ** 2 for b in btc_ret)
+        atr = sum(tr_list[:period])
+        smooth_pos = sum(dm_pos[:period])
+        smooth_neg = sum(dm_neg[:period])
+        dx_list = []
 
-        if var_alt == 0 or var_btc == 0:
-            return 0.0, 1.0
+        for i in range(period, len(tr_list)):
+            atr = atr - (atr / period) + tr_list[i]
+            smooth_pos = smooth_pos - (smooth_pos / period) + dm_pos[i]
+            smooth_neg = smooth_neg - (smooth_neg / period) + dm_neg[i]
+            if atr == 0:
+                continue
+            di_pos = (smooth_pos / atr) * 100.0
+            di_neg = (smooth_neg / atr) * 100.0
+            di_sum = di_pos + di_neg
+            dx = (abs(di_pos - di_neg) / di_sum) * 100.0 if di_sum > 0 else 0.0
+            dx_list.append(dx)
 
-        correlation = cov / ((var_alt * var_btc) ** 0.5)
-        beta = cov / var_btc if var_btc > 0 else 1.0
-        return correlation, beta
+        return sum(dx_list[-period:]) / period if len(dx_list) >= period else 20.0
 
-    def scan_candidate(self, symbol: str, macro_state: Dict[str, Any], btc_candles_15m: List[tuple]) -> Optional[Dict[str, Any]]:
+    async def scan_single_symbol(self, symbol: str, macro_state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        DUAL-ENGINE SCANNER:
-        - Chế độ 1: Beta Trend (Đồng pha với BTC khi BTC có Trend)
-        - Chế độ 2: Decoupled Alpha (Săn sóng riêng khi BTC Sideway/Range)
+        TẦNG 2: LỌC SÂU ĐA KHUNG (Chạy song song bằng asyncio cho từng coin)
         """
-        k1h_raw = self.client.get_kline(symbol, interval="Min60", limit=100)
-        k15m_raw = self.client.get_kline(symbol, interval="Min15", limit=100)
+        loop = asyncio.get_running_loop()
+        # Kéo đồng thời nến 4H, 1H và 15M
+        k4h_fut = loop.run_in_executor(None, self.client.get_kline, symbol, "Min240", 40)
+        k1h_fut = loop.run_in_executor(None, self.client.get_kline, symbol, "Min60", 60)
+        k15m_fut = loop.run_in_executor(None, self.client.get_kline, symbol, "Min15", 60)
 
-        if not k1h_raw or not k15m_raw or len(k1h_raw) < 50 or len(k15m_raw) < 50:
+        k4h_raw, k1h_raw, k15m_raw = await asyncio.gather(k4h_fut, k1h_fut, k15m_fut)
+
+        if not k4h_raw or not k1h_raw or not k15m_raw or len(k15m_raw) < 30 or len(k4h_raw) < 25:
             return None
 
-        c1h = [self._extract_ohlc(k) for k in k1h_raw if self._extract_ohlc(k)[3] > 0][:-1]
-        c15m = [self._extract_ohlc(k) for k in k15m_raw if self._extract_ohlc(k)[3] > 0][:-1]
-        curr_p = float(k15m_raw[-1].get("close", 0.0) if isinstance(k15m_raw[-1], dict) else k15m_raw[-1][2])
+        c4h = [self._extract_ohlc(k) for k in k4h_raw if self._extract_ohlc(k)[3] > 0]
+        c1h = [self._extract_ohlc(k) for k in k1h_raw if self._extract_ohlc(k)[3] > 0]
+        c15m = [self._extract_ohlc(k) for k in k15m_raw if self._extract_ohlc(k)[3] > 0]
 
-        last_15m = c15m[-1]
-        vols_15m = [float(c[4]) for c in c15m]
-        ma20_vol_15m = sum(vols_15m[-21:-1]) / 20.0 if len(vols_15m) >= 21 else 1.0
-        vol_ratio_15m = (float(last_15m[4]) / ma20_vol_15m) if ma20_vol_15m > 0 else 1.0
+        curr_p = float(c15m[-1][3])
+        c15m_closed = c15m[:-1]
+        c1h_closed = c1h[:-1]
+        c4h_closed = c4h[:-1]
 
-        closes_15m = [float(c[3]) for c in c15m]
-        closes_1h = [float(c[3]) for c in c1h]
+        last_15m = c15m_closed[-1]
+        vols_15m = [float(c[4]) for c in c15m_closed]
+        avg_vol_20 = sum(vols_15m[-21:-1]) / 20.0 if len(vols_15m) >= 21 else 1.0
+        vol_spike = (float(last_15m[4]) / avg_vol_20) if avg_vol_20 > 0 else 1.0
 
-        ema12_15m = self.calculate_ema(closes_15m, 12)
-        ema20_15m = self.calculate_ema(closes_15m, 20)
-        ema20_1h = self.calculate_ema(closes_1h, 20)
+        adx_15m = self.calculate_adx(c15m_closed, 14)
+        up_bb_1h, mid_bb_1h, low_bb_1h, bw_1h = self.calculate_bollinger_bands(c1h_closed, 20)
+        up_bb_15m, mid_bb_15m, low_bb_15m, _ = self.calculate_bollinger_bands(c15m_closed, 20)
+        rsi6_15m = self.calculate_rsi(c15m_closed, 6)
 
-        regime = macro_state.get("regime", "RANGE_STABLE")
-        btc_bias = macro_state.get("bias", "NEUTRAL")
-
-        # =========================================================================
-        # CHẾ ĐỘ 1: ALTCOIN BÁM THEO BTC (HIGH-BETA TREND)
-        # Kích hoạt khi BTC có sóng đẩy rõ rệt (TREND_BULLISH hoặc TREND_BEARISH)
-        # =========================================================================
-        if regime in ["TREND_BULLISH", "TREND_BEARISH"]:
-            btc_closes_15m = [float(c[3]) for c in btc_candles_15m] if btc_candles_15m else []
-            corr, beta = self.calculate_correlation_and_beta(closes_15m, btc_closes_15m)
-
-            # Điều kiện 1: Tương quan thuận chặt chẽ (corr >= 0.70) và nhạy sóng (beta >= 1.1)
-            # Điều kiện 2: Volume chỉ cần ổn định (>= 1.0x trung bình 20 nến)
-            if corr >= 0.70 and beta >= 1.10 and vol_ratio_15m >= 1.0:
-                if btc_bias == "BULL":
-                    # Altcoin giữ trên EMA20 1H và đang test hỗ trợ EMA12/EMA20 15M
-                    if last_15m[3] > ema20_1h and (curr_p >= ema20_15m * 0.995):
-                        dist = abs(curr_p - ema12_15m) / curr_p
-                        if dist <= 0.008:
-                            return {
-                                "symbol": symbol,
-                                "bias": "LONG",
-                                "engine_mode": "BETA_TREND",
-                                "current_price": curr_p,
-                                "vol_ratio": round(vol_ratio_15m, 2),
-                                "corr_btc": round(corr, 2),
-                                "beta": round(beta, 2),
-                                "signal_desc": f"Sóng Đồng Pha BTC (Corr: {corr:.2f}, Beta: {beta:.2f}x) - Nảy hỗ trợ EMA12/20",
-                                "ohlcv_closed": {"15m": c15m[-30:], "1h": c1h[-30:]}
-                            }
-                elif btc_bias == "BEAR":
-                    if last_15m[3] < ema20_1h and (curr_p <= ema20_15m * 1.005):
-                        dist = abs(curr_p - ema12_15m) / curr_p
-                        if dist <= 0.008:
-                            return {
-                                "symbol": symbol,
-                                "bias": "SHORT",
-                                "engine_mode": "BETA_TREND",
-                                "current_price": curr_p,
-                                "vol_ratio": round(vol_ratio_15m, 2),
-                                "corr_btc": round(corr, 2),
-                                "beta": round(beta, 2),
-                                "signal_desc": f"Sóng Xả Đồng Pha BTC (Corr: {corr:.2f}, Beta: {beta:.2f}x) - Hồi cản EMA12/20",
-                                "ohlcv_closed": {"15m": c15m[-30:], "1h": c1h[-30:]}
-                            }
+        # Tính chỉ báo 4H để cung cấp cho Auditor Veto
+        up_bb_4h, mid_bb_4h, low_bb_4h, _ = self.calculate_bollinger_bands(c4h_closed, 20)
+        rsi6_4h = self.calculate_rsi(c4h_closed, 6)
 
         # =========================================================================
-        # CHẾ ĐỘ 2: ALTCOIN SÓNG RIÊNG (DECOUPLED ALPHA BREAKOUT)
-        # Kích hoạt khi BTC Sideway đi ngang (RANGE_STABLE) hoặc tiền xoay vòng
+        # 1. TIÊU CHUẨN TIER 1: SÓNG MẠNH (TREND EXPANSION)
         # =========================================================================
-        # Điều kiện khắt khe: Volume đột biến nổ >= 2.5x
-        if vol_ratio_15m >= 2.5:
-            up_bb_1h, mid_bb_1h, low_bb_1h, bw_1h = self.calculate_bollinger_bands(c1h, 20)
-            last_1h = c1h[-1]
-
-            bias = None
-            # Nén hộp Bollinger Bands 1H co thắt <= 5% rồi bung mạnh
-            if bw_1h <= 0.05:
-                if last_1h[3] >= up_bb_1h and btc_bias != "BEAR":
-                    bias = "LONG"
-                elif last_1h[3] <= low_bb_1h and btc_bias != "BULL":
-                    bias = "SHORT"
-            else:
-                # Đột phá nến 15M vượt cản độc lập
-                if last_15m[3] > mid_bb_1h and btc_bias != "BEAR":
-                    bias = "LONG"
-                elif last_15m[3] < mid_bb_1h and btc_bias != "BULL":
-                    bias = "SHORT"
-
+        if vol_spike >= 2.5 and adx_15m >= 30.0 and bw_1h <= 0.05:
+            last_1h = c1h_closed[-1]
+            bias = "LONG" if last_1h[3] >= up_bb_1h else ("SHORT" if last_1h[3] <= low_bb_1h else None)
             if bias:
                 return {
                     "symbol": symbol,
+                    "tier": "TIER_1_STRONG_TREND",
                     "bias": bias,
-                    "engine_mode": "DECOUPLED_ALPHA",
                     "current_price": curr_p,
-                    "vol_ratio": round(vol_ratio_15m, 2),
+                    "vol_spike": round(vol_spike, 2),
+                    "adx": round(adx_15m, 1),
                     "bw_1h": round(bw_1h * 100, 2),
-                    "signal_desc": f"Bùng Nổ Độc Lập Nén Hộp (Vol: {vol_ratio_15m:.1f}x MA20, BBW 1H: {bw_1h*100:.1f}%)",
-                    "ohlcv_closed": {"15m": c15m[-30:], "1h": c1h[-30:]}
+                    "signal_desc": f"Tier 1 Sóng Mạnh (Vol {vol_spike:.1f}x, ADX {adx_15m:.1f}, BBW {bw_1h*100:.1f}%)",
+                    "indicators_4h": {"rsi6": rsi6_4h, "boll_ub": up_bb_4h, "boll_lb": low_bb_4h},
+                    "indicators_15m": {"boll_ub": up_bb_15m, "boll_mid": mid_bb_15m, "boll_lb": low_bb_15m, "rsi6": rsi6_15m},
+                    "ohlcv_closed_15m": c15m_closed[-30:]
                 }
+
+        # =========================================================================
+        # 2. TIÊU CHUẨN TIER 2: SÓNG NGẮN (RANGE SCALPING)
+        # =========================================================================
+        if vol_spike >= 1.2:
+            o_p, h_p, l_p, c_p = float(last_15m[0]), float(last_15m[1]), float(last_15m[2]), float(last_15m[3])
+            body = abs(c_p - o_p)
+
+            # Xét Scalp Long tại mép dưới (BOLL LB)
+            if last_15m[2] <= low_bb_15m and rsi6_15m <= 28.0:
+                lower_wick = min(o_p, c_p) - l_p
+                # Nến rút chân từ chối giá: râu dưới >= 1.2x thân nến
+                if lower_wick >= (1.2 * body):
+                    # Khoảng cách từ Entry đến trục giữa BOLL Mid >= 0.9%
+                    dist_to_mid = (mid_bb_15m - curr_p) / curr_p
+                    if dist_to_mid >= 0.009:
+                        return {
+                            "symbol": symbol,
+                            "tier": "TIER_2_SCALP_QUICK",
+                            "bias": "LONG",
+                            "current_price": curr_p,
+                            "vol_spike": round(vol_spike, 2),
+                            "adx": round(adx_15m, 1),
+                            "signal_desc": f"Tier 2 Scalp Biên Dưới (Râu rút chân {lower_wick/max(body,1e-6):.1f}x, Biên tới Mid {dist_to_mid*100:.2f}%)",
+                            "indicators_4h": {"rsi6": rsi6_4h, "boll_ub": up_bb_4h, "boll_lb": low_bb_4h},
+                            "indicators_15m": {"boll_ub": up_bb_15m, "boll_mid": mid_bb_15m, "boll_lb": low_bb_15m, "rsi6": rsi6_15m},
+                            "ohlcv_closed_15m": c15m_closed[-30:]
+                        }
+
+            # Xét Scalp Short tại mép trên (BOLL UB)
+            elif last_15m[1] >= up_bb_15m and rsi6_15m >= 72.0:
+                upper_wick = h_p - max(o_p, c_p)
+                # Nến rụt đầu từ chối giá: râu trên >= 1.2x thân nến
+                if upper_wick >= (1.2 * body):
+                    dist_to_mid = (curr_p - mid_bb_15m) / curr_p
+                    if dist_to_mid >= 0.009:
+                        return {
+                            "symbol": symbol,
+                            "tier": "TIER_2_SCALP_QUICK",
+                            "bias": "SHORT",
+                            "current_price": curr_p,
+                            "vol_spike": round(vol_spike, 2),
+                            "adx": round(adx_15m, 1),
+                            "signal_desc": f"Tier 2 Scalp Biên Trên (Râu rụt đầu {upper_wick/max(body,1e-6):.1f}x, Biên tới Mid {dist_to_mid*100:.2f}%)",
+                            "indicators_4h": {"rsi6": rsi6_4h, "boll_ub": up_bb_4h, "boll_lb": low_bb_4h},
+                            "indicators_15m": {"boll_ub": up_bb_15m, "boll_mid": mid_bb_15m, "boll_lb": low_bb_15m, "rsi6": rsi6_15m},
+                            "ohlcv_closed_15m": c15m_closed[-30:]
+                        }
 
         return None
 
-
-async def run_scout_and_auditor_loop():
-    """Vòng lặp phối hợp Agent 2 (Scout), Agent 3 (Auditor) & Agent 5 (Risk Controller)"""
-    import json
-    import os
-    import asyncio
-    from config import STATE_MACRO_FILE
-    from data.universe import UniverseManager
-    from agent_auditor import RiskAuditorAgent
-    from agent_risk import RiskControllerAgent
-
-    client = MexcPublicClient()
-    universe = UniverseManager(client)
-    scout = ScoutAgent(client)
-    auditor = RiskAuditorAgent()
-    risk_ctrl = RiskControllerAgent()
-
-    logger.info("Agent 2, 3 & 5 (Scout, Auditor & Risk) đã kích hoạt chu kỳ 180s (Dual-Engine Mode).")
-
-    while True:
-        try:
-            # 1. Đọc macro_state.json từ Agent 1
-            macro = {}
-            if os.path.exists(STATE_MACRO_FILE):
-                try:
-                    with open(STATE_MACRO_FILE, "r", encoding="utf-8") as f:
-                        macro = json.load(f)
-                except Exception:
-                    pass
-
-            # Gatekeeper: Nếu có tin tức đỏ hoặc BTC biến động sốc -> Dừng chu kỳ
-            if not macro.get("allow_trade", True):
-                freeze_reason = macro.get("freeze_reason", "Cầu chì kích hoạt")
-                logger.warning(f"⏸️ [GATEKEEPER CHẶN QUÉT]: {freeze_reason}")
-                await asyncio.sleep(180)
-                continue
-
-            regime = macro.get("regime", "RANGE_STABLE")
-            mode_desc = "CHẾ ĐỘ 1: BÁM SÓNG ĐỒNG PHA BTC (BETA)" if "TREND" in regime else "CHẾ ĐỘ 2: SĂN SÓNG ĐỘC LẬP (ALPHA)"
-            logger.info(f"🔄 [SCOUT DUAL-ENGINE] Trạng thái: {regime} ➔ Kích hoạt {mode_desc}")
-
-            # Kéo nến 15M của BTC để làm mốc đối chiếu tương quan
-            btc_raw = await asyncio.to_thread(client.get_kline, "BTC_USDT", "Min15", 35)
-            btc_candles_15m = [scout._extract_ohlc(k) for k in (btc_raw or []) if scout._extract_ohlc(k)[3] > 0][:-1]
-
-            # 2. Lọc sàn thanh khoản >= 1.5M USDT
-            eligible, _ = await asyncio.to_thread(universe.get_eligible_symbols, 1500000.0)
-            target_symbols = [x["symbol"] for x in eligible[:120]]
-
-            # 3. Agent 2 quét ứng viên theo 2 chế độ song song
-            candidates = []
-            for sym in target_symbols:
-                c = await asyncio.to_thread(scout.scan_candidate, sym, macro, btc_candles_15m)
-                if c:
-                    candidates.append(c)
-                await asyncio.sleep(0.02)
-
-            logger.info(f"🎯 Scout tìm thấy {len(candidates)} ứng viên hợp lệ.")
-
-            # 4. Agent 3 thẩm định an toàn & Agent 5 duyệt rủi ro
-            for item in candidates[:3]:
-                funding = await asyncio.to_thread(client.get_funding_rate, item["symbol"])
-                can_open, risk_reason = risk_ctrl.can_open_position(item["bias"], funding)
-                if not can_open:
-                    logger.info(f"Agent 5 Veto {item['symbol']}: {risk_reason}")
-                    continue
-
-                is_valid, audit_reason, plan = await asyncio.to_thread(auditor.audit_trade, item)
-                if is_valid:
-                    # Gán nhãn chế độ vào plan để hiển thị rõ lên Telegram
-                    plan["engine_mode"] = item.get("engine_mode", "ALPHA")
-                    plan["signal_desc"] = item.get("signal_desc", "")
-                    await asyncio.to_thread(auditor.broadcast_signal, plan)
-                    await asyncio.sleep(1.0)
-                else:
-                    logger.info(f"Agent 3 Veto {item['symbol']}: {audit_reason}")
-
-        except Exception as e:
-            logger.error(f"Lỗi vòng quét Scout/Auditor: {e}")
-
-        await asyncio.sleep(180)
+    async def scan_market_parallel(self, symbols: List[str], macro_state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Gửi request song song cho toàn bộ 25-30 coin, hoàn tất < 5s"""
+        tasks = [self.scan_single_symbol(sym, macro_state) for sym in symbols]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        valid_candidates = [r for r in results if isinstance(r, dict) and r is not None]
+        return valid_candidates
