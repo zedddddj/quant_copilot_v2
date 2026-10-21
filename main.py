@@ -13,11 +13,12 @@ from config import (
     ENABLE_TELEGRAM, 
     VN_TZ, 
     STATE_MACRO_FILE,
-    STATE_TRADES_FILE
+    STATE_TRADES_FILE,
+    STATE_RISK_FILE
 )
 from data.mexc_client import MexcPublicClient
 from data.universe import UniverseManager
-from agent_strategist import StrategistAgent
+from agent_strategist import StrategistAgent, run_strategist_and_news_radar
 from agent_risk import RiskControllerAgent
 from agent_scout import ScoutAgent
 from agent_auditor import RiskAuditorAgent
@@ -27,9 +28,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("MultiAgentEngineV2")
 
 # =========================================================================
-# ASYNC HTTP HEALTH CHECK SERVER CHO RENDER WEB SERVICE
+# 1. ASYNC HTTP HEALTH CHECK SERVER CHO RENDER WEB SERVICE
 # =========================================================================
 async def handle_http_request(reader, writer):
+    """Phản hồi HTTP 200 OK cho Render Health Check mà không cần thư viện ngoài"""
     try:
         await reader.read(512)
         response = (
@@ -58,7 +60,7 @@ async def start_health_server():
         await server.serve_forever()
 
 # =========================================================================
-# KHỞI TẠO ĐỒNG BỘ 5 AGENTS
+# 2. KHỞI TẠO CÁC AGENT ĐỒNG BỘ
 # =========================================================================
 client = MexcPublicClient()
 universe = UniverseManager(client)
@@ -69,6 +71,7 @@ auditor = RiskAuditorAgent()
 monitor = PositionMonitorAgent(client)
 
 def send_startup_alert(macro_info: dict):
+    """Gửi thông báo khởi động kèm trạng thái vĩ mô ban đầu lên Telegram"""
     if not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     
@@ -96,27 +99,15 @@ def send_startup_alert(macro_info: dict):
         logger.error(f"Lỗi gửi tin nhắn mở màn: {e}")
 
 # =========================================================================
-# TIẾN TRÌNH AGENT 1: STRATEGIST & NEWS RADAR (CHẠY MỖI 60s)
-# =========================================================================
-async def run_agent_strategist_loop():
-    logger.info("Agent 1 (Strategist & News Radar) đã bắt đầu chạy.")
-    while True:
-        try:
-            await asyncio.to_thread(strategist.update_btc_macro)
-        except Exception as e:
-            logger.error(f"Lỗi Strategist loop: {e}")
-        await asyncio.sleep(60)
-
-# =========================================================================
-# TIẾN TRÌNH AGENT 2, 3, 5: SCOUT, AUDITOR & RISK (CHẠY MỖI 180s)
+# 3. TIẾN TRÌNH AGENT 2, 3, 5: SCOUT, AUDITOR & RISK CONTROLLER (MỖI 180s)
 # =========================================================================
 async def run_pipeline_scout_loop():
     logger.info("Agent 2, 3 & 5 (Scout, Auditor & Risk Controller) đã bắt đầu chạy.")
     while True:
         try:
-            # 1. Đọc Gatekeeper từ macro_state.json
-            macro = {}
-            if os.path.exists(STATE_MACRO_FILE):
+            # 1. Đọc Gatekeeper từ macro_state.json hoặc bộ nhớ RAM của Agent 1
+            macro = getattr(strategist, "last_state", {})
+            if not macro and os.path.exists(STATE_MACRO_FILE):
                 try:
                     with open(STATE_MACRO_FILE, "r", encoding="utf-8") as f:
                         macro = json.load(f)
@@ -133,7 +124,7 @@ async def run_pipeline_scout_loop():
             btc_bias = macro.get("bias", "NEUTRAL")
             logger.info(f"🔍 [SCAN] Trạng thái BTC: {regime} ({btc_bias}). Bắt đầu quét Altcoin...")
 
-            # Kéo nến 15M của BTC để làm mốc tính hệ số tương quan
+            # Kéo nến 15M của BTC để làm mốc tính hệ số tương quan (Correlation)
             btc_raw = await asyncio.to_thread(client.get_kline, "BTC_USDT", "Min15", 35)
             btc_candles_15m = [scout._extract_ohlc(k) for k in (btc_raw or []) if scout._extract_ohlc(k)[3] > 0][:-1]
 
@@ -141,7 +132,7 @@ async def run_pipeline_scout_loop():
             eligible, _ = await asyncio.to_thread(universe.get_eligible_symbols, 1500000.0)
             target_symbols = [x["symbol"] for x in eligible[:120]]
 
-            # 3. Agent 2 quét ứng viên
+            # 3. Agent 2 quét ứng viên theo 2 chế độ (Beta Trend & Decoupled Alpha)
             candidates = []
             for sym in target_symbols:
                 c = await asyncio.to_thread(scout.scan_candidate, sym, macro, btc_candles_15m)
@@ -151,7 +142,7 @@ async def run_pipeline_scout_loop():
 
             logger.info(f"🎯 Scout: Tìm thấy {len(candidates)} ứng viên tiềm năng.")
 
-            # 4. Agent 3 Thẩm định & Agent 5 Kiểm soát Rủi ro
+            # 4. Agent 3 Thẩm định an toàn & Agent 5 Kiểm soát Rủi ro
             for item in candidates[:3]:
                 funding = await asyncio.to_thread(client.get_funding_rate, item["symbol"])
                 can_open, risk_reason = risk_ctrl.can_open_position(item["bias"], funding)
@@ -175,7 +166,7 @@ async def run_pipeline_scout_loop():
         await asyncio.sleep(180)
 
 # =========================================================================
-# TIẾN TRÌNH AGENT 4: POSITION MONITOR (CHẠY MỖI 45s)
+# 4. TIẾN TRÌNH AGENT 4: POSITION MONITOR COPILOT (MỖI 45s)
 # =========================================================================
 async def run_agent_monitor_loop():
     logger.info("Agent 4 (Position Monitor Copilot) đã bắt đầu chạy.")
@@ -187,7 +178,7 @@ async def run_agent_monitor_loop():
         await asyncio.sleep(45)
 
 # =========================================================================
-# TIẾN TRÌNH TELEGRAM HANDLER (LẮNG NGHE /status VÀ NÚT BẤM)
+# 5. TIẾN TRÌNH TELEGRAM HANDLER (LẮNG NGHE /status VÀ NÚT BẤM)
 # =========================================================================
 async def run_telegram_listener():
     if not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN:
@@ -205,28 +196,54 @@ async def run_telegram_listener():
                 for update in data.get("result", []):
                     offset = update["update_id"] + 1
 
-                    # Xử lý lệnh /status
+                    # 1. Xử lý lệnh /status (3 tầng dự phòng chống lỗi $0.0)
                     msg = update.get("message")
                     if msg and msg.get("text") == "/status":
-                        macro = {}
-                        if os.path.exists(STATE_MACRO_FILE):
+                        # Tầng 1: Đọc từ bộ nhớ RAM của Agent 1
+                        macro = getattr(strategist, "last_state", {})
+                        
+                        # Tầng 2: Nếu RAM rỗng, đọc từ macro_state.json
+                        if not macro and os.path.exists(STATE_MACRO_FILE):
                             try:
                                 with open(STATE_MACRO_FILE, "r", encoding="utf-8") as f:
                                     macro = json.load(f)
                             except Exception:
                                 pass
                         
+                        btc_price = float(macro.get("btc_price", 0.0) or 0.0)
+                        
+                        # Tầng 3: Nếu vẫn rỗng -> Gọi trực tiếp sàn MEXC Realtime
+                        if btc_price <= 0.0:
+                            try:
+                                tickers = await asyncio.to_thread(client.get_all_tickers)
+                                for t in tickers:
+                                    if t.get("symbol") == "BTC_USDT":
+                                        btc_price = float(t.get("lastPrice", 0.0) or 0.0)
+                                        break
+                            except Exception:
+                                pass
+
+                        regime = macro.get("regime", "RANGE_STABLE")
+                        bias = macro.get("bias", "NEUTRAL")
+                        chg_15m = macro.get("btc_change_15m_pct", 0.0)
+                        cb_status = "🔴 KÍCH HOẠT KHÓA" if macro.get("circuit_breaker") else "🟢 BÌNH THƯỜNG"
+                        
                         trades = monitor.load_trades()
                         active_trades = [t for t in trades.values() if t.get("status") == "OPEN"]
                         active_syms = ", ".join([f"{t['symbol']}({t['direction']})" for t in active_trades]) or "Không có"
                         
+                        risk_state = risk_ctrl.load_risk_state()
+                        recent_sl_count = len(risk_state.get("recent_stop_losses", []))
+
                         status_msg = (
                             f"📊 <b>[BÁO CÁO HỆ THỐNG /STATUS]</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━\n"
-                            f"• <b>BTC:</b> ${macro.get('btc_price', 0):,.1f} | {macro.get('regime')} ({macro.get('bias')})\n"
-                            f"• <b>Cầu chì:</b> {'🔴 KHÓA' if macro.get('circuit_breaker') else '🟢 BÌNH THƯỜNG'}\n"
-                            f"• <b>Vị thế đang giám sát:</b> {len(active_trades)} ({active_syms})\n"
-                            f"• <b>Hạ tầng:</b> 5 Agents đang hoạt động đồng bộ."
+                            f"• <b>BTC:</b> <code>${btc_price:,.1f}</code> | <b>{regime}</b> (<b>{bias}</b>)\n"
+                            f"• <b>Biến động BTC 15M:</b> <b>{chg_15m}%</b>\n"
+                            f"• <b>Cầu chì BTC:</b> {cb_status}\n"
+                            f"• <b>Vị thế đang giám sát:</b> <b>{len(active_trades)}</b> ({active_syms})\n"
+                            f"• <b>Chuỗi Stop Loss gần nhất:</b> <b>{recent_sl_count}/2</b>\n"
+                            f"• <b>Hạ tầng:</b> 5 Agents đang hoạt động độc lập."
                         )
                         requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
                             "chat_id": TELEGRAM_CHAT_ID,
@@ -234,14 +251,18 @@ async def run_telegram_listener():
                             "parse_mode": "HTML"
                         })
 
-                    # Xử lý nút bấm Inline [ ✅ ĐÃ VÀO LỆNH ]
+                    # 2. Xử lý nút bấm Inline [ ✅ ĐÃ VÀO LỆNH ]
                     callback = update.get("callback_query")
                     if callback:
                         cb_data = callback.get("data", "")
                         if cb_data.startswith("ENTER_"):
                             parts = cb_data.split("_")
-                            sym, direction = parts[1], parts[2]
-                            entry, sl, tp1, tp2 = float(parts[3]), float(parts[4]), float(parts[5]), float(parts[6])
+                            sym = parts[1]
+                            direction = parts[2]
+                            entry = float(parts[3])
+                            sl = float(parts[4])
+                            tp1 = float(parts[5])
+                            tp2 = float(parts[6])
 
                             monitor.register_trade(sym, direction, entry, sl, tp1, tp2)
 
@@ -255,11 +276,13 @@ async def run_telegram_listener():
         await asyncio.sleep(2)
 
 # =========================================================================
-# HÀM CHÍNH KHỞI CHẠY HỆ THỐNG (SUPERVISOR PATTERN)
+# 6. SUPERVISOR PATTERN & ENTRYPOINT
 # =========================================================================
 async def supervisor_task(coro_func, task_name: str):
+    """Tự động phục hồi tác vụ sau 10 giây nếu gặp lỗi ngoại lệ mà không làm crash app"""
     while True:
         try:
+            logger.info(f">>> Khởi chạy tác vụ: {task_name}")
             await coro_func()
         except (KeyboardInterrupt, SystemExit):
             break
@@ -270,14 +293,14 @@ async def supervisor_task(coro_func, task_name: str):
 async def main():
     logger.info(">>> KHỞI ĐỘNG HỆ SINH THÁI QUANT MULTI-AGENT COPILOT V2...")
     
-    # 1. Khởi tạo trạng thái ban đầu của BTC
+    # 1. Khởi tạo trạng thái ban đầu của BTC ngay lập tức
     initial_macro = await asyncio.to_thread(strategist.update_btc_macro)
     send_startup_alert(initial_macro)
 
-    # 2. Chạy đồng thời Health Server và 4 tiến trình của 5 Agents
+    # 2. Chạy đồng thời Health Server cho Render và 4 tiến trình độc lập
     await asyncio.gather(
         start_health_server(),
-        supervisor_task(run_agent_strategist_loop, "Agent 1: Strategist"),
+        supervisor_task(run_strategist_and_news_radar, "Agent 1: Strategist & News Radar"),
         supervisor_task(run_pipeline_scout_loop, "Agent 2, 3 & 5: Scout & Auditor & Risk"),
         supervisor_task(run_agent_monitor_loop, "Agent 4: Position Monitor"),
         supervisor_task(run_telegram_listener, "Telegram Handler")
