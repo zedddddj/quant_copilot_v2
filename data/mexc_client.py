@@ -1,7 +1,7 @@
 import requests
 import logging
 import time
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger("MEXC_Client")
 
@@ -11,7 +11,7 @@ class MexcPublicClient:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "QuantCopilotV2/1.0",
+            "User-Agent": "QuantCopilotV2/2.0",
             "Content-Type": "application/json"
         })
 
@@ -38,7 +38,7 @@ class MexcPublicClient:
                     if data.get("success"):
                         return data.get("data", [])
             except Exception:
-                time.sleep(0.5)
+                time.sleep(0.4)
         return []
 
     def get_funding_rate(self, symbol: str) -> float:
@@ -49,6 +49,19 @@ class MexcPublicClient:
                 data = res.json()
                 if data.get("success"):
                     return float(data.get("data", {}).get("fundingRate", 0.0) or 0.0)
+        except Exception:
+            pass
+        return 0.0
+
+    def get_open_interest(self, symbol: str) -> float:
+        """Lấy Open Interest (OI) hiện tại của mã hợp đồng"""
+        url = f"{self.BASE_URL}/open_interest/{symbol}"
+        try:
+            res = self.session.get(url, timeout=6)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("success"):
+                    return float(data.get("data", {}).get("openInterest", 0.0) or 0.0)
         except Exception:
             pass
         return 0.0
