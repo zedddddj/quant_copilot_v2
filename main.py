@@ -18,7 +18,7 @@ from config import (
 )
 from data.mexc_client import MexcPublicClient
 from data.universe import UniverseManager
-from agent_strategist import StrategistAgent, run_strategist_and_news_radar, STARTUP_LOCK_FILE
+from agent_strategist import StrategistAgent, run_strategist_and_news_radar
 from agent_risk import RiskControllerAgent
 from agent_scout import ScoutAgent
 from agent_auditor import RiskAuditorAgent
@@ -63,8 +63,7 @@ scout = ScoutAgent(client)
 auditor = RiskAuditorAgent()
 monitor = PositionMonitorAgent(client)
 
-def broadcast_scout_discovery(item: dict) -> Optional[int]:
-    """Agent 2 phát tin phát hiện mã tiềm năng (Tin gốc của Chuỗi 2)"""
+def broadcast_scout_discovery(item: dict):
     if not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return None
     sym = item["symbol"]
@@ -85,9 +84,6 @@ def broadcast_scout_discovery(item: dict) -> Optional[int]:
         pass
     return None
 
-# =========================================================================
-# VÒNG LẶP SĂN KÈO CHÍNH CỦA SCOUT & AUDITOR (CHU KỲ 180s)
-# =========================================================================
 async def run_pipeline_scout_loop():
     logger.info("Agent 2, 3 & 5 (Scout, Auditor & Risk Controller) bắt đầu quét thị trường...")
     while True:
@@ -106,14 +102,10 @@ async def run_pipeline_scout_loop():
                 await asyncio.sleep(180)
                 continue
 
-            # Tầng 1: Lọc thô siêu tốc < 1s
             top_symbols = await asyncio.to_thread(universe.get_top_active_symbols, 1500000.0, 30)
-
-            # Tầng 2: Lọc sâu song song đa khung < 5s
             candidates = await scout.scan_market_parallel(top_symbols, macro)
             logger.info(f"🎯 Scout: Lọc được {len(candidates)} ứng viên thỏa mãn cấu trúc.")
 
-            # CHUỖI 2: XÂU CHUỖI SCOUT -> AUDITOR -> MONITOR
             for item in candidates[:3]:
                 funding = await asyncio.to_thread(client.get_funding_rate, item["symbol"])
                 can_open, risk_reason = risk_ctrl.can_open_position(item["bias"], funding)
@@ -121,11 +113,9 @@ async def run_pipeline_scout_loop():
                     logger.info(f"🛡️ [RISK VETO] {item['symbol']}: {risk_reason}")
                     continue
 
-                # 1. Scout phát tin phát hiện (Tin gốc)
                 scout_msg_id = await asyncio.to_thread(broadcast_scout_discovery, item)
                 item["scout_msg_id"] = scout_msg_id
 
-                # 2. Auditor thẩm định và Reply vào tin của Scout
                 is_valid, audit_reason, plan = await asyncio.to_thread(auditor.audit_trade, item)
                 if is_valid:
                     logger.info(f"🚀 [DUYỆT LỆNH] Phát tín hiệu {plan['symbol']} ({plan['tier']})")
@@ -164,54 +154,65 @@ async def run_telegram_listener():
                     offset = update["update_id"] + 1
 
                     msg = update.get("message")
-                    if msg and msg.get("text") == "/status":
-                        macro = getattr(strategist, "last_state", {})
-                        if not macro and os.path.exists(STATE_MACRO_FILE):
-                            try:
-                                with open(STATE_MACRO_FILE, "r", encoding="utf-8") as f:
-                                    macro = json.load(f)
-                            except Exception:
-                                pass
-                        
-                        btc_price = float(macro.get("btc_price", 0.0) or 0.0)
-                        if btc_price <= 0.0:
-                            try:
-                                tickers = await asyncio.to_thread(client.get_all_tickers)
-                                for t in tickers:
-                                    if t.get("symbol") == "BTC_USDT":
-                                        btc_price = float(t.get("lastPrice", 0.0) or 0.0)
-                                        break
-                            except Exception:
-                                pass
+                    if msg and msg.get("text"):
+                        text_cmd = msg.get("text").strip()
 
-                        regime = macro.get("regime", "RANGE_STABLE")
-                        bias = macro.get("bias", "BULLISH_ACCUMULATION")
-                        chg_15m = macro.get("btc_change_15m_pct", 0.0)
-                        funding_btc = macro.get("funding_btc", 0.0)
-                        cb_status = "🔴 KÍCH HOẠT KHÓA" if macro.get("circuit_breaker") else "🟢 BÌNH THƯỜNG"
-                        
-                        trades = monitor.load_trades()
-                        active_trades = [t for t in trades.values() if t.get("status") == "OPEN"]
-                        active_syms = ", ".join([f"{t['symbol']}({t['direction']})" for t in active_trades]) or "Không có"
-                        
-                        risk_state = risk_ctrl.load_risk_state()
-                        recent_sl_count = len(risk_state.get("recent_stop_losses", []))
+                        if text_cmd == "/status":
+                            macro = getattr(strategist, "last_state", {})
+                            if not macro and os.path.exists(STATE_MACRO_FILE):
+                                try:
+                                    with open(STATE_MACRO_FILE, "r", encoding="utf-8") as f:
+                                        macro = json.load(f)
+                                except Exception:
+                                    pass
+                            
+                            btc_price = float(macro.get("btc_price", 0.0) or 0.0)
+                            if btc_price <= 0.0:
+                                try:
+                                    tickers = await asyncio.to_thread(client.get_all_tickers)
+                                    for t in tickers:
+                                        if t.get("symbol") == "BTC_USDT":
+                                            btc_price = float(t.get("lastPrice", 0.0) or 0.0)
+                                            break
+                                except Exception:
+                                    pass
 
-                        status_msg = (
-                            f"📊 <b>[BÁO CÁO HỆ THỐNG /STATUS]</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━\n"
-                            f"• <b>BTC:</b> <code>${btc_price:,.1f}</code> | <b>{regime}</b> (<b>{bias}</b>)\n"
-                            f"• <b>Nến đóng 15M gần nhất:</b> <b>{chg_15m:+.2f}%</b> | <b>Funding:</b> <code>{funding_btc:+0.4f}%</code>\n"
-                            f"• <b>Cầu chì BTC:</b> {cb_status}\n"
-                            f"• <b>Vị thế đang giám sát:</b> <b>{len(active_trades)}</b> ({active_syms})\n"
-                            f"• <b>Chuỗi Stop Loss gần nhất:</b> <b>{recent_sl_count}/2</b>\n"
-                            f"• <b>Hạ tầng:</b> 5 Agents đang hoạt động ổn định."
-                        )
-                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                            "chat_id": TELEGRAM_CHAT_ID,
-                            "text": status_msg,
-                            "parse_mode": "HTML"
-                        })
+                            regime = macro.get("regime", "RANGE_STABLE")
+                            bias = macro.get("bias", "BULLISH_ACCUMULATION")
+                            chg_15m = macro.get("btc_change_15m_pct", 0.0)
+                            funding_btc = macro.get("funding_btc", 0.0)
+                            cb_status = "🔴 KÍCH HOẠT KHÓA" if macro.get("circuit_breaker") else "🟢 BÌNH THƯỜNG"
+                            
+                            trades = monitor.load_trades()
+                            active_trades = [t for t in trades.values() if t.get("status") == "OPEN"]
+                            active_syms = ", ".join([f"{t['symbol']}({t['direction']})" for t in active_trades]) or "Không có"
+                            
+                            risk_state = risk_ctrl.load_risk_state()
+                            recent_sl_count = len(risk_state.get("recent_stop_losses", []))
+
+                            status_msg = (
+                                f"📊 <b>[BÁO CÁO HỆ THỐNG /STATUS]</b>\n"
+                                f"━━━━━━━━━━━━━━━━━━━\n"
+                                f"• <b>BTC:</b> <code>${btc_price:,.1f}</code> | <b>{regime}</b> (<b>{bias}</b>)\n"
+                                f"• <b>Nến đóng 15M gần nhất:</b> <b>{chg_15m:+.2f}%</b> | <b>Funding:</b> <code>{funding_btc:+0.4f}%</code>\n"
+                                f"• <b>Cầu chì BTC:</b> {cb_status}\n"
+                                f"• <b>Vị thế đang giám sát:</b> <b>{len(active_trades)}</b> ({active_syms})\n"
+                                f"• <b>Chuỗi Stop Loss gần nhất:</b> <b>{recent_sl_count}/2</b>\n"
+                                f"• <b>Hạ tầng:</b> 5 Agents đang chạy ổn định."
+                            )
+                            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                                "chat_id": TELEGRAM_CHAT_ID,
+                                "text": status_msg,
+                                "parse_mode": "HTML"
+                            })
+
+                        elif text_cmd == "/macro":
+                            compass_text = strategist.generate_macro_compass_text("YÊU CẦU BẢN ĐỒ VĨ MÔ TỨC THÌ")
+                            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                                "chat_id": TELEGRAM_CHAT_ID,
+                                "text": compass_text,
+                                "parse_mode": "HTML"
+                            })
 
                     callback = update.get("callback_query")
                     if callback:
@@ -247,19 +248,6 @@ async def supervisor_task(coro_func, task_name: str):
 
 async def main():
     logger.info(">>> KHỞI ĐỘNG HỆ SINH THÁI QUANT COPILOT V2...")
-    
-    # =========================================================================
-    # KHÓA CỨNG: CHỈ PHÁT BẢN TIN COMPASS DUY NHẤT 1 LẦN KHI DEPLOY XONG
-    # =========================================================================
-    if not os.path.exists(STARTUP_LOCK_FILE):
-        logger.info("Phát bản tin mở màn lần đầu tiên...")
-        try:
-            await asyncio.to_thread(strategist.generate_and_send_macro_compass_with_thread)
-            with open(STARTUP_LOCK_FILE, "w") as f:
-                f.write(str(time.time()))
-        except Exception as e:
-            logger.error(f"Lỗi gửi bản tin khởi động: {e}")
-
     await asyncio.gather(
         start_health_server(),
         supervisor_task(run_strategist_and_news_radar, "Agent 1: Strategist & News Radar"),
