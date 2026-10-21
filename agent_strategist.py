@@ -20,14 +20,11 @@ class StrategistAgent:
         self.last_briefing_date: Optional[str] = None
         self.last_checkpoint_hour: Optional[int] = None
         self.last_monday_date: Optional[str] = None
+        self.startup_sent: bool = False  # Khóa cứng: Chỉ gửi tin mở màn DUY NHẤT 1 LẦN
+        self.last_shock_alert_time: float = 0  # Cooldown tránh spam tin sốc
 
     @staticmethod
     def _extract_ohlc(k) -> tuple:
-        """
-        Chuẩn định dạng MEXC Contract Kline:
-        [time, open, close, high, low, volume, amount]
-        -> Trả về: (open, high, low, close, volume)
-        """
         if isinstance(k, dict):
             return (
                 float(k.get("open", 0.0) or 0.0),
@@ -52,7 +49,6 @@ class StrategistAgent:
 
     @staticmethod
     def calculate_rsi_series(closes: List[float], period: int = 6) -> float:
-        """Tính RSI chuẩn xác trên chuỗi giá đóng cửa của các nến hoàn chỉnh"""
         if len(closes) < period + 1:
             return 50.0
 
@@ -70,11 +66,9 @@ class StrategistAgent:
         if len(gains) < period:
             return 50.0
 
-        # Tính trung bình khởi tạo (Simple Average)
         avg_gain = sum(gains[:period]) / period
         avg_loss = sum(losses[:period]) / period
 
-        # Làm mượt theo chuẩn Wilder (Wilder's Smoothing)
         for i in range(period, len(gains)):
             avg_gain = (avg_gain * (period - 1) + gains[i]) / period
             avg_loss = (avg_loss * (period - 1) + losses[i]) / period
@@ -95,10 +89,8 @@ class StrategistAgent:
             res = requests.post(url, json=payload, timeout=8)
             if res.status_code == 200:
                 return res.json().get("result", {}).get("message_id")
-            else:
-                logger.error(f"Lỗi gửi Telegram: {res.text}")
         except Exception as e:
-            logger.error(f"Ngoại lệ gửi tin nhắn Telegram: {e}")
+            logger.error(f"Lỗi gửi tin nhắn Telegram: {e}")
         return None
 
     def fetch_forex_factory_calendar(self) -> List[Dict[str, Any]]:
@@ -137,6 +129,7 @@ class StrategistAgent:
                 diff_m = (ev_time - now_utc).total_seconds() / 60.0
 
                 ev_id = f"{ev.get('title')}_{date_str}"
+                # CHỈ BÁO TIN ĐỎ TRƯỚC 30 PHÚT VÀ 60 PHÚT (MỖI MỐC CHỈ GỬI 1 LẦN)
                 if 25.0 <= diff_m <= 35.0 and f"{ev_id}_30" not in self.notified_news:
                     self.dispatch_macro_shock_thread(
                         title=f"Tin Đỏ USD: {ev.get('title')}",
@@ -159,45 +152,34 @@ class StrategistAgent:
         return active_freeze, freeze_reason or "An toàn trước tin tức", next_event
 
     def dispatch_macro_shock_thread(self, title: str, change_15m: float):
-        """CHUỖI 1: TỰ ĐỘNG THẢO LUẬN THEO CHUỖI KHI CÓ SỰ KIỆN VĨ MÔ / SHOCK BTC"""
+        """CHUỖI 1: CHỈ PHÁT KHI CÓ BIẾN CỐ THỰC SỰ (CÓ COOLDOWN 2 TIẾNG CHỐNG SPAM)"""
+        now = time.time()
+        if now - self.last_shock_alert_time < 7200:  # Không bắn lại nếu cách dưới 2 tiếng
+            return
+        self.last_shock_alert_time = now
+
         msg_1 = (
             f"🚨 <b>[AGENT 1 - STRATEGIST] CẢNH BÁO BIẾN CỐ VĨ MÔ</b>\n"
             f"• <b>Sự kiện:</b> {title}\n"
             f"• <b>Nến BTC 15M:</b> <b>{change_15m:+.2f}%</b>\n"
-            f"• <b>Chỉ thị:</b> Tạm dừng mở vị thế Altcoin mới, rà soát bảo vệ danh mục."
+            f"• <b>Chỉ thị:</b> Tạm dừng mở vị thế Altcoin mới, rà soát danh mục."
         )
         root_id = self.send_telegram(msg_1)
         if not root_id:
             return
 
         time.sleep(1.0)
-        self.send_telegram(
-            "🤖 <b>[AGENT 2 - SCOUT]</b>:\n"
-            "• Đã nhận chỉ thị vĩ mô từ Strategist.\n"
-            "• Tạm dừng quét tín hiệu Altcoin Long trong 45 phút.",
-            reply_to_id=root_id
-        )
-
+        self.send_telegram("🤖 <b>[AGENT 2 - SCOUT]</b>: Đã nhận chỉ thị. Tạm dừng quét Altcoin Long.", reply_to_id=root_id)
         time.sleep(1.0)
-        self.send_telegram(
-            "⏳ <b>[AGENT 4 - MONITOR]</b>:\n"
-            "• Rà soát các vị thế đang chạy.\n"
-            "• Khuyến nghị kiểm tra dời Stop Loss về hòa vốn bảo toàn lợi nhuận.",
-            reply_to_id=root_id
-        )
-
+        self.send_telegram("⏳ <b>[AGENT 4 - MONITOR]</b>: Rà soát vị thế đang mở. Khuyến nghị kiểm tra dời SL về hòa vốn.", reply_to_id=root_id)
         time.sleep(1.0)
-        self.send_telegram(
-            "🛡️ <b>[AGENT 5 - RISK CONTROLLER]</b>:\n"
-            "• Đã kích hoạt cầu chì tự động (CIRCUIT_LOCK).\n"
-            "• Cổng mở lệnh mới bị đóng băng, bảo vệ toàn bộ số dư ký quỹ.",
-            reply_to_id=root_id
-        )
+        self.send_telegram("🛡️ <b>[AGENT 5 - RISK CONTROLLER]</b>: Đã khóa cổng mở lệnh mới (CIRCUIT_LOCK).", reply_to_id=root_id)
 
     def update_btc_macro(self) -> Dict[str, Any]:
+        """Cập nhật dữ liệu ngầm cho hệ thống, hoàn toàn không gửi tin Telegram"""
         c15m, c1h, c4h, c1w = [], [], [], []
 
-        for _ in range(3):
+        for _ in range(2):
             k15m_raw = self.client.get_kline("BTC_USDT", interval="Min15", limit=60)
             k1h_raw = self.client.get_kline("BTC_USDT", interval="Min60", limit=60)
             k4h_raw = self.client.get_kline("BTC_USDT", interval="Min240", limit=60)
@@ -210,7 +192,7 @@ class StrategistAgent:
 
             if c15m and c1h:
                 break
-            time.sleep(0.4)
+            time.sleep(0.3)
 
         curr_btc = float(c15m[-1][3]) if c15m else 0.0
         if curr_btc <= 0:
@@ -222,18 +204,11 @@ class StrategistAgent:
         if curr_btc <= 0:
             curr_btc = 82500.0
 
-        # =========================================================================
-        # SỬA LỖI ĐỘNG LƯỢNG 15M VÀ RSI 50.0:
-        # Bắt buộc tính trên các nến ĐÃ ĐÓNG CỬA HOÀN CHỈNH (bỏ cây [-1] đang chạy)
-        # =========================================================================
+        # TÍNH CHUẨN NẾN ĐÃ ĐÓNG CỬA HOÀN CHỈNH [-2]
         if len(c15m) >= 3:
-            # c15m[-2]: Nến đóng cửa hoàn chỉnh gần nhất
-            # c15m[-3]: Nến đóng cửa hoàn chỉnh trước đó
             c_prev = c15m[-2]
             c_before = c15m[-3]
             btc_change_15m = ((float(c_prev[3]) - float(c_before[3])) / float(c_before[3])) * 100.0
-            
-            # Lấy toàn bộ giá đóng cửa của các nến đã hoàn thành để tính RSI
             closed_closes_15m = [float(x[3]) for x in c15m[:-1]]
             rsi6_15m = float(self.calculate_rsi_series(closed_closes_15m, period=6))
         elif len(c15m) >= 2:
@@ -247,6 +222,13 @@ class StrategistAgent:
 
         is_shock = (abs(btc_change_15m) >= 0.8) or (rsi6_15m >= 85.0) or (rsi6_15m <= 15.0)
         has_news, news_reason, next_ev = self.check_news_radar()
+
+        # Chỉ kích hoạt nếu có shock biến động
+        if is_shock:
+            self.dispatch_macro_shock_thread(
+                title=f"Biến động giật nến 15M ({btc_change_15m:+.2f}%)",
+                change_15m=btc_change_15m
+            )
 
         closes_1h = [float(c[3]) for c in c1h] if c1h else [curr_btc]
         ema20_1h = sum(closes_1h[-20:]) / len(closes_1h[-20:])
@@ -295,10 +277,8 @@ class StrategistAgent:
 
         return state
 
-    def generate_and_send_macro_compass_with_thread(self):
-        """
-        BẢN TIN MỞ MÀN KÈM CHUỖI THẢO LUẬN THEO DÕI CỦA 4 AGENTS
-        """
+    def generate_and_send_macro_compass_with_thread(self, title_prefix: str = "BTC MACRO COMPASS - BẢN ĐỒ VĨ MÔ & DỰ BÁO XU HƯỚNG"):
+        """GỬI BẢN TIN VĨ MÔ VÀ CHUỖI 4 AGENT REPLY"""
         state = self.update_btc_macro()
         btc_p = state["btc_price"]
         bias_str = state["bias"]
@@ -321,20 +301,17 @@ class StrategistAgent:
             sc_a = f"BTC chịu cản tại ${week_open:,.1f}, tiếp tục trượt dốc về quét đáy ${pwl:,.1f}."
             sc_b = f"Nếu nến 4H bứt phá ngược lên ${week_open:,.1f} -> Đảo chiều hồi phục kỹ thuật."
 
-        news_str = f"🔴 {next_ev['title']} ({next_ev['time']} - còn {next_ev['minutes']}p)" if next_ev else "🟢 Không có tin tức đỏ USD đáng chú ý trong ngày"
+        news_str = f"🔴 {next_ev['title']} ({next_ev['time']} - còn {next_ev['minutes']}p)" if next_ev else "🟢 Không có tin tức đỏ USD High Impact trong ngày"
         cb_str = "🔴 KÍCH HOẠT (Tạm khóa Altcoin)" if state["circuit_breaker"] else "🟢 AN TOÀN (Cho phép quét Altcoin)"
 
-        # =========================================================================
-        # 1. BẢN TIN GỐC CỦA AGENT 1 (STRATEGIST)
-        # =========================================================================
         msg_compass = (
-            f"🧭 <b>[BTC MACRO COMPASS - BẢN ĐỒ VĨ MÔ & DỰ BÁO XU HƯỚNG]</b>\n"
+            f"🧭 <b>[{title_prefix}]</b>\n"
             f"⏱ <i>Cập nhật lúc: {now_str}</i>\n\n"
             f"📊 <b>1. TỔNG QUAN ĐỊA HÌNH VĨ MÔ:</b>\n"
             f"• <b>BTC Realtime:</b> <code>${btc_p:,.1f}</code> | <b>Bias:</b> <b>{bias_str}</b>\n"
             f"• <b>Cản tuần HTF:</b> Đỉnh <code>${pwh:,.1f}</code> | Đáy <code>${pwl:,.1f}</code>\n"
             f"• <b>Mở cửa tuần (Week Open):</b> <code>${week_open:,.1f}</code> (Giá đang {pos_str})\n"
-            f"• <b>Phái sinh:</b> Funding Rate <code>{funding:+0.4f}%</code> (Cân bằng, không có bẫy thanh lý)\n\n"
+            f"• <b>Phái sinh:</b> Funding Rate <code>{funding:+0.4f}%</code> (Cân bằng, không bẫy)\n\n"
             f"📉 <b>2. ĐỘNG LƯỢNG NẾN & DIỄN BIẾN GẦN NHẤT:</b>\n"
             f"• Nến đóng 15M gần nhất: <b>{chg_15m:+.2f}%</b> | RSI6 15M: <b>{rsi_15m:.1f}</b>\n"
             f"• Cấu trúc nến 4H: Đang giữ trên trục EMA20 (<code>${ema20_4h:,.1f}</code>)\n"
@@ -344,7 +321,7 @@ class StrategistAgent:
             f"• <b>Kịch bản A (Chính):</b> {sc_a}\n"
             f"• <b>Kịch bản B (Phủ định):</b> {sc_b}\n\n"
             f"⚔️ <b>4. CHỈ THỊ HỆ THỐNG GIAO DỊCH:</b>\n"
-            f"• Kích hoạt đồng thời: <b>Tier 1 (Nổ Vol >= 2.5x)</b> & <b>Tier 2 (Săn phản ứng biên BOLL)</b>.\n"
+            f"• Kích hoạt đồng thời: <b>Tier 1 (Nổ Vol >= 2.5x)</b> & <b>Tier 2 (Sóng ngắn biên BOLL)</b>.\n"
             f"• Ưu tiên: Tìm các Altcoin nén hộp bứt phá độc lập với BTC."
         )
 
@@ -352,12 +329,7 @@ class StrategistAgent:
         if not root_msg_id:
             return
 
-        # Delay tự nhiên 1.5 giây
-        time.sleep(1.5)
-
-        # =========================================================================
-        # 2. AGENT 2 (SCOUT) REPLY XÁC NHẬN CHỈ THỊ
-        # =========================================================================
+        time.sleep(1.2)
         scout_bias_text = "TÍCH LŨY (BULLISH_ACCUMULATION)" if "BULL" in bias_str else "PHÒNG THỦ (BEARISH_DEFENSIVE)"
         self.send_telegram(
             f"🤖 <b>[AGENT 2 - SCOUT]</b>:\n"
@@ -367,10 +339,6 @@ class StrategistAgent:
         )
 
         time.sleep(1.0)
-
-        # =========================================================================
-        # 3. AGENT 5 (RISK CONTROLLER) REPLY BÁO CÁO HẠN MỨC AN TOÀN
-        # =========================================================================
         risk_data = {}
         if os.path.exists(STATE_RISK_FILE):
             try:
@@ -379,7 +347,6 @@ class StrategistAgent:
             except Exception:
                 pass
         sl_count = len(risk_data.get("recent_stop_losses", []))
-        
         self.send_telegram(
             f"🛡️ <b>[AGENT 5 - RISK CONTROLLER]</b>:\n"
             f"• Trạng thái cầu chì: 🟢 AN TOÀN ({sl_count}/2 SL liên tiếp).\n"
@@ -388,10 +355,6 @@ class StrategistAgent:
         )
 
         time.sleep(1.0)
-
-        # =========================================================================
-        # 4. AGENT 4 (POSITION MONITOR) REPLY BÁO CÁO TRẠNG THÁI CHỜ
-        # =========================================================================
         trades_data = {}
         if os.path.exists(STATE_TRADES_FILE):
             try:
@@ -400,33 +363,40 @@ class StrategistAgent:
             except Exception:
                 pass
         open_trades_count = sum(1 for t in trades_data.values() if t.get("status") == "OPEN")
-
         self.send_telegram(
             f"⏳ <b>[AGENT 4 - MONITOR / COPILOT]</b>:\n"
             f"• Danh mục hiện tại: <b>{open_trades_count} lệnh</b> đang mở.\n"
-            f"• Radar Copilot đang ở chế độ chờ (Standby), sẵn sàng tiếp nhận giám sát và tư vấn dời Stop Loss khi bạn bấm nút xác nhận.",
+            f"• Radar Copilot đang ở chế độ chờ (Standby), sẵn sàng nhận lệnh từ Auditor khi có tín hiệu khớp.",
             reply_to_id=root_msg_id
         )
 
     def check_scheduled_checkpoints(self):
+        """CHỈ CHẠY VÀO ĐẦU TUẦN, ĐẦU NGÀY VÀ CÁC MỐC CỐ ĐỊNH"""
         now_vn = datetime.datetime.now(VN_TZ)
         hour = now_vn.hour
         minute = now_vn.minute
         weekday = now_vn.weekday()
         today_str = now_vn.strftime("%Y-%m-%d")
 
+        # 1. Đầu tuần: 07:05 Thứ Hai
         if weekday == 0 and hour == 7 and 5 <= minute <= 10 and self.last_monday_date != today_str:
-            self.generate_and_send_macro_compass_with_thread()
+            self.generate_and_send_macro_compass_with_thread(title_prefix="BẢN TIN CHIẾN LƯỢC ĐẦU TUẦN (WEEKLY REGIME)")
             self.last_monday_date = today_str
             self.last_briefing_date = today_str
+
+        # 2. Đầu ngày: 07:05 Hàng ngày
         elif hour == 7 and 5 <= minute <= 10 and self.last_briefing_date != today_str:
-            self.generate_and_send_macro_compass_with_thread()
+            self.generate_and_send_macro_compass_with_thread(title_prefix="BẢN TIN SÁNG 07:05 AM - DAILY CLOSE")
             self.last_briefing_date = today_str
+
+        # 3. Mốc 13:00 PM (Giữa ngày)
         elif hour == 13 and 0 <= minute <= 5 and self.last_checkpoint_hour != 13:
-            self.generate_and_send_macro_compass_with_thread()
+            self.generate_and_send_macro_compass_with_thread(title_prefix="CHECKPOINT GIỮA NGÀY 13:00 PM")
             self.last_checkpoint_hour = 13
+
+        # 4. Mốc 19:30 PM (Trước phiên Mỹ)
         elif hour == 19 and 30 <= minute <= 35 and self.last_checkpoint_hour != 19:
-            self.generate_and_send_macro_compass_with_thread()
+            self.generate_and_send_macro_compass_with_thread(title_prefix="CHECKPOINT TRƯỚC PHIÊN MỸ 19:30 PM")
             self.last_checkpoint_hour = 19
 
 
@@ -434,9 +404,13 @@ async def run_strategist_and_news_radar():
     client = MexcPublicClient()
     agent = StrategistAgent(client)
 
-    logger.info("⚡ [STRATEGIST STARTUP] Khởi tạo và phát ngay bản tin Compass kèm Reply Thread...")
-    await asyncio.to_thread(agent.generate_and_send_macro_compass_with_thread)
+    # CHỈ PHÁT 1 LẦN DUY NHẤT LÚC KHỞI ĐỘNG HỆ THỐNG
+    if not agent.startup_sent:
+        logger.info("⚡ [STRATEGIST STARTUP] Khởi tạo bản tin Compass mở màn...")
+        await asyncio.to_thread(agent.generate_and_send_macro_compass_with_thread)
+        agent.startup_sent = True
 
+    # DUY TRÌ THEO DÕI NỀN MỖI 60s (IM LẶNG, KHÔNG PHÁT TIN NẾU KHÔNG CÓ SỰ KIỆN ĐẶC BIỆT)
     while True:
         try:
             await asyncio.to_thread(agent.update_btc_macro)
