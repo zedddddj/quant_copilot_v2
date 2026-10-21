@@ -55,24 +55,38 @@ class UniverseManager:
             return True
         return any(sub in sym_u for sub in BANNED_SUBSTRINGS)
 
-    def get_eligible_symbols(self, min_turnover_24h: float = 1500000.0) -> Tuple[List[Dict[str, Any]], List[str]]:
+    def get_top_active_symbols(self, min_turnover_24h: float = 1500000.0, top_n: int = 30) -> List[str]:
+        """
+        TẦNG 1: LỌC THÔ SIÊU TỐC (< 1s)
+        - 1 Request lấy toàn bộ Tickers.
+        - Lọc sàn Volume 24h >= 1.5M USDT.
+        - Sắp xếp và lấy Top 25-30 coin có biến động / dòng tiền sôi động nhất.
+        """
         tickers = self.client.get_all_tickers()
         if not tickers:
-            return [], []
+            return []
 
-        eligible = []
+        candidates = []
         for t in tickers:
             sym = t.get("symbol", "")
             if not sym.endswith("_USDT") or self.is_tradfi(sym):
                 continue
+
             amt = float(t.get("amount24", 0.0) or 0.0)
+            last_p = float(t.get("lastPrice", 0.0) or 0.0)
             if amt == 0.0:
-                amt = float(t.get("volume24", 0.0) or 0.0) * float(t.get("lastPrice", 0.0) or 0.0)
-            if amt >= min_turnover_24h:
-                eligible.append({
-                    "symbol": sym,
-                    "volume_24h": amt,
-                    "last_price": float(t.get("lastPrice", 0.0) or 0.0)
-                })
-        eligible.sort(key=lambda x: x["volume_24h"], reverse=True)
-        return eligible, [x["symbol"] for x in eligible]
+                amt = float(t.get("volume24", 0.0) or 0.0) * last_p
+
+            if amt < min_turnover_24h or last_p <= 0.0:
+                continue
+
+            # Đo độ sôi động = Volume 24h kết hợp biên độ thay đổi trong ngày
+            rise_rate = abs(float(t.get("riseRate", 0.0) or 0.0))
+            score = amt * (1.0 + rise_rate)
+            candidates.append({"symbol": sym, "score": score, "amount": amt})
+
+        # Sắp xếp theo độ sôi động và lấy đúng top_n (25-30 coin)
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        top_symbols = [x["symbol"] for x in candidates[:top_n]]
+        logger.info(f"⚡ [TẦNG 1] Đã lọc nhanh {len(tickers)} tickers -> Chọn Top {len(top_symbols)} coin sôi động nhất.")
+        return top_symbols
