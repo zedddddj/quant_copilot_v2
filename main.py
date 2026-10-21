@@ -18,7 +18,7 @@ from config import (
 )
 from data.mexc_client import MexcPublicClient
 from data.universe import UniverseManager
-from agent_strategist import StrategistAgent, run_strategist_and_news_radar
+from agent_strategist import StrategistAgent, run_strategist_and_news_radar, STARTUP_LOCK_FILE
 from agent_risk import RiskControllerAgent
 from agent_scout import ScoutAgent
 from agent_auditor import RiskAuditorAgent
@@ -51,7 +51,7 @@ async def handle_http_request(reader, writer):
 async def start_health_server():
     port = int(os.environ.get("PORT", 10000))
     server = await asyncio.start_server(handle_http_request, "0.0.0.0", port)
-    logger.info(f"🌐 [PORT BINDING] Server HTTP Health Check đã mở ngay cổng {port} cho Render!")
+    logger.info(f"🌐 [PORT BINDING] Server HTTP Health Check đã mở cổng {port} cho Render!")
     async with server:
         await server.serve_forever()
 
@@ -64,6 +64,7 @@ auditor = RiskAuditorAgent()
 monitor = PositionMonitorAgent(client)
 
 def broadcast_scout_discovery(item: dict) -> Optional[int]:
+    """Agent 2 phát tin phát hiện mã tiềm năng (Tin gốc của Chuỗi 2)"""
     if not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return None
     sym = item["symbol"]
@@ -84,29 +85,11 @@ def broadcast_scout_discovery(item: dict) -> Optional[int]:
         pass
     return None
 
-def send_scout_scan_summary(scanned_count: int, candidate_count: int, veto_count: int):
-    """Báo cáo nhịp quét định kỳ của Scout & Auditor để bạn theo dõi liên tục"""
-    if not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    now_str = datetime.datetime.now(VN_TZ).strftime("%H:%M:%S")
-    msg = (
-        f"📡 <b>[NHỊP QUÉT SCOUT & AUDIT] ({now_str})</b>\n"
-        f"• Quét sâu: <b>{scanned_count} coin sôi động</b>\n"
-        f"• Tìm thấy: <b>{candidate_count} ứng viên</b> đạt cấu trúc\n"
-        f"• Auditor thẩm định / Veto an toàn: <b>{veto_count} mã</b>\n"
-        f"• <i>Trạng thái: Radar tiếp tục tìm kiếm kèo đạt chuẩn 100%...</i>"
-    )
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=6)
-    except Exception:
-        pass
-
 # =========================================================================
-# TIẾN TRÌNH QUÉT LIÊN TỤC CỦA SCOUT VÀ AUDITOR (BÁO CÁO MỖI 180s)
+# VÒNG LẶP SĂN KÈO CHÍNH CỦA SCOUT & AUDITOR (CHU KỲ 180s)
 # =========================================================================
 async def run_pipeline_scout_loop():
-    logger.info("Agent 2, 3 & 5 (Scout, Auditor & Risk Controller) bắt đầu chu kỳ quét liên tục...")
+    logger.info("Agent 2, 3 & 5 (Scout, Auditor & Risk Controller) bắt đầu quét thị trường...")
     while True:
         try:
             macro = getattr(strategist, "last_state", {})
@@ -123,33 +106,33 @@ async def run_pipeline_scout_loop():
                 await asyncio.sleep(180)
                 continue
 
+            # Tầng 1: Lọc thô siêu tốc < 1s
             top_symbols = await asyncio.to_thread(universe.get_top_active_symbols, 1500000.0, 30)
+
+            # Tầng 2: Lọc sâu song song đa khung < 5s
             candidates = await scout.scan_market_parallel(top_symbols, macro)
-            
-            veto_count = 0
-            # Duyệt các ứng viên tìm được
+            logger.info(f"🎯 Scout: Lọc được {len(candidates)} ứng viên thỏa mãn cấu trúc.")
+
+            # CHUỖI 2: XÂU CHUỖI SCOUT -> AUDITOR -> MONITOR
             for item in candidates[:3]:
                 funding = await asyncio.to_thread(client.get_funding_rate, item["symbol"])
                 can_open, risk_reason = risk_ctrl.can_open_position(item["bias"], funding)
                 if not can_open:
-                    veto_count += 1
+                    logger.info(f"🛡️ [RISK VETO] {item['symbol']}: {risk_reason}")
                     continue
 
+                # 1. Scout phát tin phát hiện (Tin gốc)
                 scout_msg_id = await asyncio.to_thread(broadcast_scout_discovery, item)
                 item["scout_msg_id"] = scout_msg_id
 
+                # 2. Auditor thẩm định và Reply vào tin của Scout
                 is_valid, audit_reason, plan = await asyncio.to_thread(auditor.audit_trade, item)
                 if is_valid:
+                    logger.info(f"🚀 [DUYỆT LỆNH] Phát tín hiệu {plan['symbol']} ({plan['tier']})")
                     await asyncio.to_thread(auditor.broadcast_signal, plan)
                     await asyncio.sleep(1.0)
                 else:
-                    veto_count += 1
-
-            # NẾU KHÔNG CÓ KÈO KHỚP: Gửi 1 tin báo cáo nhịp quét để bạn an tâm bot đang rà soát liên tục
-            if len(candidates) == 0:
-                await asyncio.to_thread(send_scout_scan_summary, len(top_symbols), 0, 0)
-            elif veto_count > 0 and len(candidates) > 0:
-                await asyncio.to_thread(send_scout_scan_summary, len(top_symbols), len(candidates), veto_count)
+                    logger.info(f"🛡️ [AUDITOR VETO] {item['symbol']}: {audit_reason}")
 
         except Exception as e:
             logger.error(f"Lỗi pipeline loop: {e}")
@@ -157,6 +140,7 @@ async def run_pipeline_scout_loop():
         await asyncio.sleep(180)
 
 async def run_agent_monitor_loop():
+    logger.info("Agent 4 (Position Monitor Copilot) bắt đầu theo dõi...")
     while True:
         try:
             await asyncio.to_thread(monitor.check_active_positions)
@@ -221,7 +205,7 @@ async def run_telegram_listener():
                             f"• <b>Cầu chì BTC:</b> {cb_status}\n"
                             f"• <b>Vị thế đang giám sát:</b> <b>{len(active_trades)}</b> ({active_syms})\n"
                             f"• <b>Chuỗi Stop Loss gần nhất:</b> <b>{recent_sl_count}/2</b>\n"
-                            f"• <b>Hạ tầng:</b> 5 Agents đang chạy ổn định."
+                            f"• <b>Hạ tầng:</b> 5 Agents đang hoạt động ổn định."
                         )
                         requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
                             "chat_id": TELEGRAM_CHAT_ID,
@@ -263,6 +247,19 @@ async def supervisor_task(coro_func, task_name: str):
 
 async def main():
     logger.info(">>> KHỞI ĐỘNG HỆ SINH THÁI QUANT COPILOT V2...")
+    
+    # =========================================================================
+    # KHÓA CỨNG: CHỈ PHÁT BẢN TIN COMPASS DUY NHẤT 1 LẦN KHI DEPLOY XONG
+    # =========================================================================
+    if not os.path.exists(STARTUP_LOCK_FILE):
+        logger.info("Phát bản tin mở màn lần đầu tiên...")
+        try:
+            await asyncio.to_thread(strategist.generate_and_send_macro_compass_with_thread)
+            with open(STARTUP_LOCK_FILE, "w") as f:
+                f.write(str(time.time()))
+        except Exception as e:
+            logger.error(f"Lỗi gửi bản tin khởi động: {e}")
+
     await asyncio.gather(
         start_health_server(),
         supervisor_task(run_strategist_and_news_radar, "Agent 1: Strategist & News Radar"),
