@@ -11,8 +11,6 @@ from data.mexc_client import MexcPublicClient
 
 logger = logging.getLogger("TheStrategist")
 
-STARTUP_LOCK_FILE = ".startup_compass_sent.lock"
-
 class StrategistAgent:
     def __init__(self, client: MexcPublicClient):
         self.client = client
@@ -129,21 +127,18 @@ class StrategistAgent:
             try:
                 ev_time = datetime.datetime.fromisoformat(date_str)
                 diff_m = (ev_time - now_utc).total_seconds() / 60.0
-
                 ev_id = f"{ev.get('title')}_{date_str}"
+
                 if 25.0 <= diff_m <= 35.0 and f"{ev_id}_30" not in self.notified_news:
-                    self.dispatch_macro_shock_thread(
-                        title=f"Tin Đỏ USD: {ev.get('title')}",
-                        change_15m=self.last_state.get("btc_change_15m_pct", 0.0)
-                    )
+                    self.send_telegram(f"🚨 <b>[AGENT 1 - RADAR TIN ĐỎ]</b>: Tin USD <b>{ev.get('title')}</b> sắp công bố sau 30 phút! Tạm khóa mở lệnh mới.")
                     self.notified_news.add(f"{ev_id}_30")
                 elif 55.0 <= diff_m <= 65.0 and f"{ev_id}_60" not in self.notified_news:
-                    self.send_telegram(f"⚠️ <b>[AGENT 1 - RADAR TIN TỨC]</b>: Sắp có tin đỏ <b>{ev.get('title')}</b> lúc {ev_time.astimezone(VN_TZ).strftime('%H:%M')} (còn ~60 phút).")
+                    self.send_telegram(f"⚠️ <b>[AGENT 1 - RADAR TIN ĐỎ]</b>: Sắp có tin đỏ <b>{ev.get('title')}</b> lúc {ev_time.astimezone(VN_TZ).strftime('%H:%M')} (còn ~60 phút).")
                     self.notified_news.add(f"{ev_id}_60")
 
                 if -30.0 <= diff_m <= 30.0:
                     active_freeze = True
-                    freeze_reason = f"NEWS_FREEZE: Tin đỏ USD [{ev.get('title')}] (cách {abs(diff_m):.0f} phút)"
+                    freeze_reason = f"NEWS_FREEZE: Tin đỏ USD [{ev.get('title')}]"
 
                 if diff_m > 0 and (next_event is None or diff_m < next_event["minutes"]):
                     next_event = {"title": ev.get("title"), "minutes": round(diff_m), "time": ev_time.astimezone(VN_TZ).strftime('%H:%M')}
@@ -151,29 +146,6 @@ class StrategistAgent:
                 continue
 
         return active_freeze, freeze_reason or "An toàn trước tin tức", next_event
-
-    def dispatch_macro_shock_thread(self, title: str, change_15m: float):
-        now = time.time()
-        if now - self.last_shock_alert_time < 7200:
-            return
-        self.last_shock_alert_time = now
-
-        msg_1 = (
-            f"🚨 <b>[AGENT 1 - STRATEGIST] CẢNH BÁO BIẾN CỐ VĨ MÔ</b>\n"
-            f"• <b>Sự kiện:</b> {title}\n"
-            f"• <b>Nến BTC 15M:</b> <b>{change_15m:+.2f}%</b>\n"
-            f"• <b>Chỉ thị:</b> Tạm dừng mở vị thế Altcoin mới, rà soát danh mục."
-        )
-        root_id = self.send_telegram(msg_1)
-        if not root_id:
-            return
-
-        time.sleep(1.0)
-        self.send_telegram("🤖 <b>[AGENT 2 - SCOUT]</b>: Đã nhận chỉ thị. Tạm dừng quét Altcoin Long.", reply_to_id=root_id)
-        time.sleep(1.0)
-        self.send_telegram("⏳ <b>[AGENT 4 - MONITOR]</b>: Rà soát vị thế đang mở. Khuyến nghị kiểm tra dời SL về hòa vốn.", reply_to_id=root_id)
-        time.sleep(1.0)
-        self.send_telegram("🛡️ <b>[AGENT 5 - RISK CONTROLLER]</b>: Đã kích hoạt chốt khóa mở lệnh (CIRCUIT_LOCK).", reply_to_id=root_id)
 
     def update_btc_macro(self) -> Dict[str, Any]:
         c15m, c1h, c4h, c1w = [], [], [], []
@@ -263,12 +235,12 @@ class StrategistAgent:
         try:
             with open(STATE_MACRO_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"Lỗi ghi state macro: {e}")
+        except Exception:
+            pass
 
         return state
 
-    def generate_and_send_macro_compass_with_thread(self, title_prefix: str = "BTC MACRO COMPASS - BẢN ĐỒ VĨ MÔ & DỰ BÁO XU HƯỚNG"):
+    def generate_macro_compass_text(self, title_prefix: str = "BTC MACRO COMPASS - BẢN ĐỒ VĨ MÔ & DỰ BÁO XU HƯỚNG") -> str:
         state = self.update_btc_macro()
         btc_p = state["btc_price"]
         bias_str = state["bias"]
@@ -294,7 +266,7 @@ class StrategistAgent:
         news_str = f"🔴 {next_ev['title']} ({next_ev['time']} - còn {next_ev['minutes']}p)" if next_ev else "🟢 Không có tin tức đỏ USD High Impact trong ngày"
         cb_str = "🔴 KÍCH HOẠT (Tạm khóa Altcoin)" if state["circuit_breaker"] else "🟢 AN TOÀN (Cho phép quét Altcoin)"
 
-        msg_compass = (
+        return (
             f"🧭 <b>[{title_prefix}]</b>\n"
             f"⏱ <i>Cập nhật lúc: {now_str}</i>\n\n"
             f"📊 <b>1. TỔNG QUAN ĐỊA HÌNH VĨ MÔ:</b>\n"
@@ -315,51 +287,6 @@ class StrategistAgent:
             f"• Ưu tiên: Tìm các Altcoin nén hộp bứt phá độc lập với BTC."
         )
 
-        root_msg_id = self.send_telegram(msg_compass)
-        if not root_msg_id:
-            return
-
-        time.sleep(1.2)
-        scout_bias_text = "TÍCH LŨY (BULLISH_ACCUMULATION)" if "BULL" in bias_str else "PHÒNG THỦ (BEARISH_DEFENSIVE)"
-        self.send_telegram(
-            f"🤖 <b>[AGENT 2 - SCOUT]</b>:\n"
-            f"• Đã nhận chỉ thị vĩ mô từ Strategist (Bias: {scout_bias_text}).\n"
-            f"• <b>Hành động:</b> Bật radar quét kép: Săn Altcoin nén hộp Tier 1 & Canh nhịp nảy biên Tier 2.",
-            reply_to_id=root_msg_id
-        )
-
-        time.sleep(1.0)
-        risk_data = {}
-        if os.path.exists(STATE_RISK_FILE):
-            try:
-                with open(STATE_RISK_FILE, "r", encoding="utf-8") as f:
-                    risk_data = json.load(f)
-            except Exception:
-                pass
-        sl_count = len(risk_data.get("recent_stop_losses", []))
-        self.send_telegram(
-            f"🛡️ <b>[AGENT 5 - RISK CONTROLLER]</b>:\n"
-            f"• Trạng thái cầu chì: 🟢 AN TOÀN ({sl_count}/2 SL liên tiếp).\n"
-            f"• Hạn mức danh mục: Tối đa 2 vị thế cùng chiều. Sẵn sàng cấp phép cho Auditor duyệt lệnh.",
-            reply_to_id=root_msg_id
-        )
-
-        time.sleep(1.0)
-        trades_data = {}
-        if os.path.exists(STATE_TRADES_FILE):
-            try:
-                with open(STATE_TRADES_FILE, "r", encoding="utf-8") as f:
-                    trades_data = json.load(f)
-            except Exception:
-                pass
-        open_trades_count = sum(1 for t in trades_data.values() if t.get("status") == "OPEN")
-        self.send_telegram(
-            f"⏳ <b>[AGENT 4 - MONITOR / COPILOT]</b>:\n"
-            f"• Danh mục hiện tại: <b>{open_trades_count} lệnh</b> đang mở.\n"
-            f"• Radar Copilot đang ở chế độ chờ (Standby), sẵn sàng nhận lệnh từ Auditor khi có tín hiệu khớp.",
-            reply_to_id=root_msg_id
-        )
-
     def check_scheduled_checkpoints(self):
         now_vn = datetime.datetime.now(VN_TZ)
         hour = now_vn.hour
@@ -368,22 +295,25 @@ class StrategistAgent:
         today_str = now_vn.strftime("%Y-%m-%d")
 
         if weekday == 0 and hour == 7 and 5 <= minute <= 10 and self.last_monday_date != today_str:
-            self.generate_and_send_macro_compass_with_thread(title_prefix="BẢN TIN CHIẾN LƯỢC ĐẦU TUẦN (WEEKLY REGIME)")
+            txt = self.generate_macro_compass_text("BẢN TIN CHIẾN LƯỢC ĐẦU TUẦN (WEEKLY REGIME)")
+            self.send_telegram(txt)
             self.last_monday_date = today_str
             self.last_briefing_date = today_str
         elif hour == 7 and 5 <= minute <= 10 and self.last_briefing_date != today_str:
-            self.generate_and_send_macro_compass_with_thread(title_prefix="BẢN TIN SÁNG 07:05 AM - DAILY CLOSE")
+            txt = self.generate_macro_compass_text("BẢN TIN SÁNG 07:05 AM - DAILY CLOSE")
+            self.send_telegram(txt)
             self.last_briefing_date = today_str
         elif hour == 13 and 0 <= minute <= 5 and self.last_checkpoint_hour != 13:
-            self.generate_and_send_macro_compass_with_thread(title_prefix="CHECKPOINT GIỮA NGÀY 13:00 PM")
+            txt = self.generate_macro_compass_text("CHECKPOINT GIỮA NGÀY 13:00 PM")
+            self.send_telegram(txt)
             self.last_checkpoint_hour = 13
         elif hour == 19 and 30 <= minute <= 35 and self.last_checkpoint_hour != 19:
-            self.generate_and_send_macro_compass_with_thread(title_prefix="CHECKPOINT TRƯỚC PHIÊN MỸ 19:30 PM")
+            txt = self.generate_macro_compass_text("CHECKPOINT TRƯỚC PHIÊN MỸ 19:30 PM")
+            self.send_telegram(txt)
             self.last_checkpoint_hour = 19
 
 
 async def run_strategist_and_news_radar():
-    """Hàm chạy nền: Tuyệt đối IM LẶNG, chỉ quét dữ liệu và kiểm tra mốc giờ"""
     client = MexcPublicClient()
     agent = StrategistAgent(client)
 
