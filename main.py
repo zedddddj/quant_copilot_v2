@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("MultiAgentEngineV2")
 
 # =========================================================================
-# 1. ASYNC HTTP HEALTH CHECK SERVER CHO RENDER WEB SERVICE
+# ASYNC HTTP HEALTH CHECK SERVER CHO RENDER
 # =========================================================================
 async def handle_http_request(reader, writer):
     try:
@@ -59,7 +59,7 @@ async def start_health_server():
         await server.serve_forever()
 
 # =========================================================================
-# 2. KHỞI TẠO CÁC AGENT ĐỒNG BỘ
+# KHỞI TẠO CÁC AGENT
 # =========================================================================
 client = MexcPublicClient()
 universe = UniverseManager(client)
@@ -70,7 +70,7 @@ auditor = RiskAuditorAgent()
 monitor = PositionMonitorAgent(client)
 
 def broadcast_scout_discovery(item: dict) -> Optional[int]:
-    """Agent 2 phát hiện mã tiềm năng (Tin gốc msg_2 của Chuỗi 2)"""
+    """Agent 2 phát tin phát hiện mã tiềm năng (Tin gốc msg_2 của Chuỗi 2)"""
     if not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return None
     sym = item["symbol"]
@@ -91,9 +91,6 @@ def broadcast_scout_discovery(item: dict) -> Optional[int]:
         pass
     return None
 
-# =========================================================================
-# 3. TIẾN TRÌNH AGENT 2, 3, 5: SCOUT, AUDITOR & RISK (CHUỖI 2)
-# =========================================================================
 async def run_pipeline_scout_loop():
     logger.info("Agent 2, 3 & 5 (Scout, Auditor & Risk Controller) bắt đầu chu kỳ 180s...")
     while True:
@@ -112,14 +109,14 @@ async def run_pipeline_scout_loop():
                 await asyncio.sleep(180)
                 continue
 
-            # Tầng 1: Lọc thô siêu tốc < 1s lấy Top 25-30 coin sôi động
+            # Tầng 1: Lọc thô siêu tốc < 1s lấy Top 25-30 coin
             top_symbols = await asyncio.to_thread(universe.get_top_active_symbols, 1500000.0, 30)
 
             # Tầng 2: Lọc sâu song song < 5s đa khung thời gian
             candidates = await scout.scan_market_parallel(top_symbols, macro)
             logger.info(f"🎯 Scout: Lọc được {len(candidates)} ứng viên thỏa mãn tiêu chuẩn Tier 1 / Tier 2.")
 
-            # THỰC THI CHUỖI 2: SCOUT (msg_2) -> AUDITOR (Reply msg_2 & tạo msg_3) -> MONITOR (Reply msg_3)
+            # CHUỖI 2: XÂU CHUỖI SCOUT -> AUDITOR -> MONITOR
             for item in candidates[:3]:
                 funding = await asyncio.to_thread(client.get_funding_rate, item["symbol"])
                 can_open, risk_reason = risk_ctrl.can_open_position(item["bias"], funding)
@@ -127,11 +124,11 @@ async def run_pipeline_scout_loop():
                     logger.info(f"🛡️ [RISK VETO] {item['symbol']}: {risk_reason}")
                     continue
 
-                # 1. Scout phát tin phát hiện (Tin gốc msg_2)
+                # 1. Scout phát tin phát hiện (Tin gốc)
                 scout_msg_id = await asyncio.to_thread(broadcast_scout_discovery, item)
                 item["scout_msg_id"] = scout_msg_id
 
-                # 2. Auditor thẩm định và Reply vào tin nhắn của Scout
+                # 2. Auditor thẩm định và Reply vào tin của Scout
                 is_valid, audit_reason, plan = await asyncio.to_thread(auditor.audit_trade, item)
                 if is_valid:
                     logger.info(f"🚀 [DUYỆT LỆNH] Phát tín hiệu {plan['symbol']} ({plan['tier']})")
@@ -145,9 +142,6 @@ async def run_pipeline_scout_loop():
 
         await asyncio.sleep(180)
 
-# =========================================================================
-# 4. TIẾN TRÌNH AGENT 4: POSITION MONITOR COPILOT (MỖI 60s)
-# =========================================================================
 async def run_agent_monitor_loop():
     logger.info("Agent 4 (Position Monitor Copilot) bắt đầu chu kỳ 60s...")
     while True:
@@ -157,9 +151,6 @@ async def run_agent_monitor_loop():
             logger.error(f"Lỗi Position Monitor loop: {e}")
         await asyncio.sleep(60)
 
-# =========================================================================
-# 5. TIẾN TRÌNH TELEGRAM HANDLER (LẮNG NGHE /status VÀ NÚT BẤM INLINE)
-# =========================================================================
 async def run_telegram_listener():
     if not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN:
         return
@@ -176,7 +167,7 @@ async def run_telegram_listener():
                 for update in data.get("result", []):
                     offset = update["update_id"] + 1
 
-                    # 1. Xử lý lệnh /status (3 tầng dự phòng chuẩn xác)
+                    # 1. Xử lý lệnh /status (Fallback 3 tầng)
                     msg = update.get("message")
                     if msg and msg.get("text") == "/status":
                         macro = getattr(strategist, "last_state", {})
@@ -227,7 +218,7 @@ async def run_telegram_listener():
                             "parse_mode": "HTML"
                         })
 
-                    # 2. Xử lý nút bấm Inline [ ✅ ĐÃ VÀO LỆNH ] (Kích hoạt Agent 4 reply tiếp vào msg_3)
+                    # 2. Xử lý nút bấm Inline [ ✅ ĐÃ VÀO LỆNH ] (Kích hoạt Agent 4 reply tiếp vào Auditor)
                     callback = update.get("callback_query")
                     if callback:
                         cb_data = callback.get("data", "")
@@ -249,9 +240,6 @@ async def run_telegram_listener():
             pass
         await asyncio.sleep(2)
 
-# =========================================================================
-# 6. SUPERVISOR PATTERN & ENTRYPOINT
-# =========================================================================
 async def supervisor_task(coro_func, task_name: str):
     while True:
         try:
